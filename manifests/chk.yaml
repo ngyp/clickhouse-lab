@@ -1,0 +1,11 @@
+apiVersion: "clickhouse-keeper.altinity.com/v1"
+kind: "ClickHouseKeeperInstallation"
+metadata:
+  name: chk
+  namespace: clickhouse
+spec:
+  configuration:
+    clusters:
+      - name: "keeper"
+        layout:
+          replicasCount: 3
