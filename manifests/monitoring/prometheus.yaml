@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: clickhouse
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-clickhouse-lab
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-clickhouse-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-clickhouse-lab
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: clickhouse
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: clickhouse
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+      # Altinity operator's own metrics (fixed Service, port 8888)
+      - job_name: clickhouse-operator
+        static_configs:
+          - targets:
+              - clickhouse-operator-altinity-clickhouse-operator-metrics.clickhouse.svc:8888
+
+      # Auto-discover all ClickHouse pods belonging to CHI "chi" via pod-role
+      # service discovery, regardless of how many shards/replicas exist.
+      - job_name: clickhouse-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["clickhouse"]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_clickhouse_altinity_com_chi]
+            action: keep
+            regex: chi
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: "${1}:9363"
+          - source_labels: [__meta_kubernetes_pod_label_clickhouse_altinity_com_shard]
+            target_label: shard
+          - source_labels: [__meta_kubernetes_pod_label_clickhouse_altinity_com_replica]
+            target_label: replica
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+        metrics_path: /metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: clickhouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.retention.time=6h
+          ports:
+            - containerPort: 9090
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 384Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: clickhouse
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090

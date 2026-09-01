@@ -512,7 +512,132 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-1-1-0 
 
 ---
 
-## 11. 접속 (호스트에서 직접 붙어보기)
+## 11. 모니터링 (Prometheus + Grafana) 연동
+
+이후 실험들의 관찰을 쉽게 하기 위해, ClickHouse 클러스터와 Altinity 오퍼레이터를
+Prometheus + Grafana로 모니터링합니다. `kube-prometheus-stack` 같은 풀 스택은 우리
+Colima VM(6 CPU/16GB, 이미 13개 파드 운영 중)에는 과합니다 — 대신 최소 구성의
+Prometheus/Grafana를 순수 kubectl 매니페스트로 직접 배포합니다. 네임스페이스는 별도로
+만들지 않고 기존 `clickhouse` 네임스페이스를 재사용합니다.
+
+### 11-1. ClickHouse 내장 Prometheus 익스포터 활성화
+
+ClickHouse 기본 이미지의 `config.xml`에는 `<prometheus>` 블록이 **주석 처리된 채로**
+이미 들어있습니다 (포트 9363, `/metrics` 엔드포인트). CHI의 `configuration.files`로
+같은 내용을 주석 없이 추가하면 오퍼레이터가 ConfigMap을 통해 모든 파드에 배포합니다.
+
+`manifests/chi.yaml`에 추가된 부분:
+
+```yaml
+spec:
+  configuration:
+    files:
+      config.d/prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+                <port>9363</port>
+                <metrics>true</metrics>
+                <events>true</events>
+                <asynchronous_metrics>true</asynchronous_metrics>
+                <status_info>true</status_info>
+            </prometheus>
+        </clickhouse>
+```
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/chi.yaml
+```
+
+> **주의**: `config.d`에 새 파일이 추가되는 변경은 ClickHouse가 즉시 핫리로드하지
+> 못하고 프로세스 재시작이 필요했습니다 (기존 파일 수정은 보통 핫리로드되지만, 새
+> 파일 추가는 재시작 전까지 포트가 열리지 않았습니다). PVC가 붙어있으므로 데이터
+> 손실 없이 안전하게 재시작할 수 있습니다:
+>
+> ```bash
+> for p in $(kubectl --context kind-clickhouse-lab -n clickhouse get pods -l clickhouse.altinity.com/chi=chi -o name); do
+>   kubectl --context kind-clickhouse-lab -n clickhouse delete $p --wait=false
+> done
+> ```
+
+확인:
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- wget -qO- localhost:9363/metrics | head
+```
+
+### 11-2. Prometheus 배포 (파드 자동 디스커버리)
+
+`manifests/monitoring/prometheus.yaml`에 ServiceAccount/ClusterRole(파드 조회 권한),
+ConfigMap(스크레이프 설정), Deployment, Service를 정의합니다. 샤드/레플리카 수가
+바뀌어도 대응할 수 있도록 고정 IP 목록이 아니라 `kubernetes_sd_configs`(role: pod)로
+`clickhouse.altinity.com/chi=chi` 레이블을 가진 파드를 자동 탐색하고, 파드 IP의
+9363 포트를 스크레이프 대상으로 relabel합니다. 오퍼레이터 자체 메트릭(고정
+Service, 8888 포트)은 별도 job으로 정적 등록합니다.
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/monitoring/prometheus.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get pods -l app=prometheus
+```
+
+접속 및 확인:
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/prometheus 9090:9090
+# 다른 터미널에서
+curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {job:.labels.job, health}'
+curl -s 'http://localhost:9090/api/v1/query?query=ClickHouse_Info' | jq '.data.result | length'
+```
+
+실측: 오퍼레이터 타겟 1개 + ClickHouse 파드 9개(3샤드×3레플리카) = 총 10개 타겟이
+모두 `up`, `ClickHouse_Info` 쿼리가 9개 시계열(파드당 1개, `shard`/`replica` 레이블
+포함)을 반환합니다.
+
+> **참고**: Altinity 오퍼레이터는 우리가 추가한 설정과 무관하게 **자체적으로도** 각
+> ClickHouse 호스트의 메트릭을 폴링해서 `chi_clickhouse_event_*`,
+> `chi_clickhouse_metric_*` 같은 이름으로 자기 메트릭 엔드포인트(8888)에 재노출하고
+> 있었습니다. 즉 오퍼레이터만 스크레이프해도 기본적인 클러스터 메트릭은 얻을 수 있고,
+> 우리가 각 파드를 직접 스크레이프하는 것은 오퍼레이터를 거치지 않는 더 세밀하고
+> 지연 없는 원본 메트릭(`ClickHouseMetric_*`, `ClickHouseProfileEvents_*` 등)을 얻기
+> 위함입니다.
+
+### 11-3. Grafana 배포
+
+`manifests/monitoring/grafana.yaml`은 Prometheus를 기본 데이터소스로 자동
+프로비저닝합니다. 익명 접속을 Admin 권한으로 허용해 두어(랩 환경 전용, 외부 노출
+없음 — ClusterIP + port-forward로만 접근) 바로 대시보드를 만들어볼 수 있고, 필요하면
+`admin`/`admin`으로도 로그인할 수 있습니다.
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/monitoring/grafana.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/grafana 3000:3000
+# 브라우저에서 http://localhost:3000 접속 (또는 admin/admin 로그인)
+```
+
+데이터소스 헬스체크로도 확인 가능:
+
+```bash
+curl -s http://localhost:3000/api/datasources/uid/<uid>/health
+# => {"status":"OK", "message":"Successfully queried the Prometheus API."}
+```
+
+### 11-4. 핵심 정리
+
+- 풀 스택 대신 최소 구성(Deployment 2개 + ConfigMap 2개 + RBAC)으로 충분히 관찰 가능한
+  환경을 만들 수 있음 — 리소스 여유가 빠듯한 로컬 kind 랩에 적합.
+- ClickHouse의 Prometheus 익스포터는 이미지에 기본 내장(주석 처리)돼 있어 CHI
+  `files`로 몇 줄만 추가하면 활성화됨. 단, **config.d에 새 파일을 추가하는 변경은
+  파드 재시작이 필요**했다(기존 파일 수정과 다른 점).
+- Kubernetes `kubernetes_sd_configs`(role: pod) + 레이블 기반 relabel을 쓰면 샤드/
+  레플리카 수가 바뀌어도(뒤에 나올 리샤딩 실험 등) Prometheus 설정을 고칠 필요가
+  없음.
+- Altinity 오퍼레이터는 이미 자체적으로 클러스터 전체 메트릭을 집계해 노출하고
+  있어서, 오퍼레이터 메트릭만으로도 상당 부분 관찰이 가능하다는 점은 예상 밖의
+  수확이었음.
+
+---
+
+## 12. 접속 (호스트에서 직접 붙어보기)
 
 ```bash
 kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/clickhouse-chi 8123:8123 9000:9000
@@ -524,7 +649,7 @@ curl 'http://localhost:8123/?query=SELECT%201'
 
 ---
 
-## 12. 정리
+## 13. 정리
 
 ```bash
 kind delete cluster --name clickhouse-lab
