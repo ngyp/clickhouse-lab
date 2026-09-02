@@ -15,7 +15,7 @@ spec:
     clusters:
       - name: "cluster1"
         layout:
-          shardsCount: 3
+          shardsCount: 4
           replicasCount: 3
     files:
       config.d/prometheus.xml: |

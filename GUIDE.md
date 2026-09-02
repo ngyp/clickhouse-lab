@@ -637,7 +637,134 @@ curl -s http://localhost:3000/api/datasources/uid/<uid>/health
 
 ---
 
-## 12. 접속 (호스트에서 직접 붙어보기)
+## 12. 클러스터 확장 & 리샤딩 (3→4 샤드)
+
+ClickHouse는 **샤드를 늘려도 기존 데이터를 자동으로 재분배하지 않습니다.** 샤딩은
+`Distributed` 테이블의 샤딩 키(`rand()`)가 "현재 샤드 개수"를 기준으로 매 INSERT 시점에
+어느 샤드로 보낼지 결정하는 것일 뿐, 이미 저장된 데이터는 그 결정이 다시 계산되지
+않습니다. 이 실험은 그 사실을 직접 확인하고, 수동으로 재분배(리샤딩)하는 절차를 보여줍니다.
+
+### 12-1. 샤드 확장
+
+`manifests/chi.yaml`에서 `shardsCount`만 3→4로 변경합니다 (모니터링 절(11절)에서 추가한
+`prometheus.xml` 설정은 그대로 둡니다):
+
+```yaml
+    clusters:
+      - name: "cluster1"
+        layout:
+          shardsCount: 4      # 3 -> 4
+          replicasCount: 3
+```
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/chi.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get chi chi -w   # Completed 대기 (12 hosts)
+```
+
+> **주의**: `shardsCount`를 바꾸면 오퍼레이터가 새 샤드(3개 파드)를 만드는 것과 별개로,
+> 클러스터 토폴로지가 담긴 ConfigMap(`<remote_servers>`)이 바뀌므로 **기존 9개 파드도
+> 전부 순차적으로 롤링 재시작**됩니다. 9개 재시작 + 3개 신규 생성이 순서대로 진행되니
+> 실제로는 수 분 정도 걸립니다. (11절에서 설정한 Prometheus는 `kubernetes_sd_configs`
+> 기반 자동 디스커버리라 별도 설정 변경 없이 타겟이 9개→12개로 자동 반영됩니다.)
+
+### 12-2. 검증: 기존 데이터는 그대로, 새 데이터만 4개 샤드로 분산
+
+```bash
+# 토폴로지 확인 (4샤드 x 3레플리카 = 12 hosts)
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q \
+  "SELECT cluster, shard_num, replica_num, host_name FROM system.clusters WHERE cluster='cluster1' ORDER BY shard_num, replica_num FORMAT PrettyCompact"
+
+# 새 샤드(shard3)는 비어 있어야 함 — 기존 데이터는 옮겨오지 않음
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-3-0-0 -- clickhouse-client -q "SELECT count() FROM events_local"
+# => 0
+
+# 새 데이터를 추가로 삽입 (id >= 100000)
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+INSERT INTO events SELECT number+100000, now(), concat('payload-', toString(number)) FROM numbers(4000)
+"
+
+# 샤드별 old_data(id<100000) vs new_data(id>=100000) 분포 비교
+for pod in chi-chi-cluster1-0-0-0 chi-chi-cluster1-1-0-0 chi-chi-cluster1-2-0-0 chi-chi-cluster1-3-0-0; do
+  echo "--- $pod ---"
+  kubectl --context kind-clickhouse-lab -n clickhouse exec $pod -- clickhouse-client -q \
+    "SELECT countIf(id<100000) AS old_data, countIf(id>=100000) AS new_data FROM events_local"
+done
+```
+
+**실측 결과**:
+
+| 샤드 | old_data (확장 전 데이터) | new_data (확장 후 삽입) |
+|---|---|---|
+| shard0 | 3034 (변화 없음) | 1040 |
+| shard1 | 2958 (변화 없음) | 985 |
+| shard2 | 3012 (변화 없음) | 1030 |
+| shard3 (신규) | **0** | 945 |
+
+새로 넣은 4000행은 4개 샤드에 고르게(~1000행씩) 분산됐지만, 확장 전부터 있던 9004행은
+단 한 건도 shard3로 넘어오지 않고 원래 위치(shard0/1/2)에 그대로 남아 있습니다.
+
+### 12-3. 수동 리샤딩: 기존 데이터 재분배
+
+기존 데이터를 새 샤드로도 분산시키려면, ClickHouse에 내장된 자동 리샤딩 도구가 없으므로
+**직접 재분배**해야 합니다. 표준적인 방법은 "`Distributed` 테이블을 통해 재삽입 →
+원본에서 삭제"입니다.
+
+```bash
+# 1) shard0의 old_data 중 절반(id가 짝수인 것)을 Distributed 테이블로 재삽입
+#    -> rand()가 다시 계산되어 4개 샤드 전체로 재분배됨
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+INSERT INTO events SELECT id, event_time, payload FROM events_local WHERE id < 100000 AND id % 2 = 0
+"
+
+# 2) 원본 shard0 테이블에서 방금 재삽입한 행 삭제 (mutation, 비동기 — system.mutations로 완료 확인)
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+ALTER TABLE events_local DELETE WHERE id < 100000 AND id % 2 = 0
+"
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q \
+  "SELECT count() FROM system.mutations WHERE table='events_local' AND is_done=0"   # 0이 될 때까지 대기
+
+# 3) 결과 확인
+for pod in chi-chi-cluster1-0-0-0 chi-chi-cluster1-1-0-0 chi-chi-cluster1-2-0-0 chi-chi-cluster1-3-0-0; do
+  echo "--- $pod old_data ---"
+  kubectl --context kind-clickhouse-lab -n clickhouse exec $pod -- clickhouse-client -q "SELECT count() FROM events_local WHERE id < 100000"
+done
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "SELECT count() FROM events"   # 총합 불변 확인
+```
+
+**실측 결과** (shard0의 1529건을 재분배 대상으로 선택):
+
+| 샤드 | 리샤딩 전 old_data | 리샤딩 후 old_data |
+|---|---|---|
+| shard0 | 3034 | 1864 |
+| shard1 | 2958 | 3365 |
+| shard2 | 3012 | 3418 |
+| shard3 | 0 | 357 |
+| **합계** | **9004** | **9004** (불변) |
+
+Distributed 총합도 13004로 리샤딩 전후 변화 없음 — 유실/중복 없이 재분배 성공.
+흥미로운 디테일: shard0에서 1529건을 삭제했는데 실제 감소는 1170건뿐입니다. `rand()`는
+재삽입 시 원본 샤드를 배제하지 않으므로, 재삽입된 행 중 일부(약 359건, 1529/4에 근접)가
+**우연히 다시 shard0으로** 돌아왔기 때문입니다. 정확성(유실/중복 없음)은 보장되지만,
+분배 효율은 완벽하지 않다는 점을 보여줍니다.
+
+> ⚠️ **`shardsCount`를 다시 3으로 줄이지 마세요.** 오퍼레이터는 `shardsCount`를 줄이면
+> 초과된 샤드(여기서는 shard3)의 파드와 PVC를 그대로 **삭제**합니다. 리샤딩으로 shard3에
+> 실제 데이터(945+357건)가 들어간 상태이므로, 축소하면 그 데이터가 영구 유실됩니다.
+
+### 12-4. 핵심 정리
+
+- 샤드 추가는 **미래에 들어올 데이터**의 분산 범위만 넓힐 뿐, 과거 데이터는 그대로 둔다.
+- 리샤딩은 "Distributed로 재삽입 + 원본에서 DELETE mutation" 조합으로 수동 수행하며,
+  ClickHouse 자체 자동화 도구는 없다 (외부 도구로 `clickhouse-copier`류가 있었으나
+  최신 버전에서는 사실상 이 수동 패턴이 표준).
+- `rand()` 기반 재분배는 원본 샤드를 배제하지 않아 완벽하게 균등하지는 않다.
+- `shardsCount`를 줄이는 축소 방향은 파괴적(데이터 유실)이므로 별도의 사전 마이그레이션
+  없이는 수행하면 안 된다.
+
+---
+
+## 13. 접속 (호스트에서 직접 붙어보기)
 
 ```bash
 kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/clickhouse-chi 8123:8123 9000:9000
@@ -649,7 +776,7 @@ curl 'http://localhost:8123/?query=SELECT%201'
 
 ---
 
-## 13. 정리
+## 14. 정리
 
 ```bash
 kind delete cluster --name clickhouse-lab
