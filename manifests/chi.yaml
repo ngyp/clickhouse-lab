@@ -17,6 +17,8 @@ spec:
         layout:
           shardsCount: 4
           replicasCount: 3
+        templates:
+          podTemplate: clickhouse-version
     files:
       config.d/prometheus.xml: |
         <clickhouse>
@@ -38,3 +40,9 @@ spec:
           resources:
             requests:
               storage: 2Gi
+    podTemplates:
+      - name: clickhouse-version
+        spec:
+          containers:
+            - name: clickhouse
+              image: clickhouse/clickhouse-server:head

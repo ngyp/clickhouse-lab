@@ -764,7 +764,113 @@ Distributed 총합도 13004로 리샤딩 전후 변화 없음 — 유실/중복 
 
 ---
 
-## 13. 접속 (호스트에서 직접 붙어보기)
+## 13. 무중단 롤링 업그레이드
+
+CHI에 `podTemplate`으로 명시적 이미지 태그를 지정하면, 오퍼레이터가 태그 변경을 감지해
+전체 클러스터를 순차적으로(rolling) 재기동합니다. `spec.configuration.clusters[].templates.podTemplate`로
+클러스터 단위에 특정 파드 템플릿을 연결합니다.
+
+```yaml
+spec:
+  configuration:
+    clusters:
+      - name: "cluster1"
+        layout:
+          shardsCount: 4
+          replicasCount: 3
+        templates:
+          podTemplate: clickhouse-version   # 아래 템플릿을 이 클러스터에 연결
+  templates:
+    podTemplates:
+      - name: clickhouse-version
+        spec:
+          containers:
+            - name: clickhouse            # 오퍼레이터가 생성하는 컨테이너 이름과 일치해야 함
+              image: clickhouse/clickhouse-server:26.8.2.7
+```
+
+### 13-1. ⚠️ 다운그레이드는 지원되지 않는다
+
+처음에는 "구버전 → 신버전" 순서로 테스트하려고 `24.8`을 baseline으로 지정했는데,
+이미 `26.8.2.7`로 가동 중이던 클러스터에 적용하자 해당 파드가 **CrashLoopBackOff**에
+빠졌습니다.
+
+```
+DB::Exception: ... (INCORRECT_FILE_NAME) ... (ASYNC_LOAD_FAILED) ...
+(version 24.8.14.39 (official build))
+```
+
+원인: `system.metric_log`(내부 시스템 테이블)의 파트가 이미 26.8이 쓴 최신 마크 파일
+포맷으로 디스크에 저장돼 있는데, 24.8의 파서가 이 포맷을 모릅니다. **ClickHouse는
+공식적으로 다운그레이드를 지원하지 않으며**, 한 번이라도 최신 포맷으로 데이터/메타데이터를
+쓴 뒤에는 예전 바이너리로 되돌아갈 수 없습니다 — 온디스크 포맷은 전진(forward)만 가능한
+편도 마이그레이션입니다.
+
+**교훈**: 롤백 계획을 세울 때 "이전 이미지 태그로 되돌리면 된다"고 가정하지 말 것.
+실제 롤백은 스냅샷/백업 복원이 필요합니다.
+
+### 13-2. 실제 업그레이드 (26.8.2.7 → 26.9.1.510 `head`)
+
+깨진 파드를 `26.8.2.7`(현재 떠 있던 버전을 `latest` 대신 명시적 태그로 고정)로 되돌려
+베이스라인을 안정화한 뒤, 이 시점보다 새로운 버전이 Docker Hub에 따로 태깅되어 있지
+않아 nightly 빌드인 `clickhouse/clickhouse-server:head`로 업그레이드했습니다.
+
+```bash
+# 베이스라인 적용 (12개 파드, 순차 롤링) 후 확정 대기
+kubectl --context kind-clickhouse-lab apply -f manifests/chi.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get chi chi -w
+
+# 이미지 태그를 head로 변경 후 재적용
+kubectl --context kind-clickhouse-lab apply -f manifests/chi.yaml
+```
+
+**관찰**: 오퍼레이터는 12개 파드를 대부분 한 번에 1~2개씩 순차적으로 교체했고
+(`ProgressHostsCompleted: N of 12` 이벤트로 진행 상황 확인 가능), 전체 롤아웃에
+**약 55분** 소요됐습니다 (베이스라인 적용도 비슷하게 오래 걸림 — 이 랩 환경의 이미지
+pull/헬스체크 주기가 지배적 요인으로 보이며, 실제 운영 클러스터의 소요 시간과는
+무관합니다).
+
+**최종 확인**:
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "SELECT version()"
+# => 26.9.1.510
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "SELECT count() FROM events"
+# => 13004 (유실 없음)
+```
+
+### 13-3. ⚠️ 가용성 프로브 방법론에 대한 교훈
+
+롤아웃 동안 `kubectl port-forward svc/clickhouse-chi 18123:8123`를 열어두고 1초마다
+`curl`로 쿼리를 반복하는 방식으로 가용성을 측정했는데, 업그레이드 시작 약 40초 후부터
+**남은 30분 내내 연결이 복구되지 않았습니다** (355/409 요청 실패).
+
+**진짜 원인**: `kubectl port-forward`는 Service 뒤의 **특정 파드 하나에 고정**됩니다.
+그 파드가 롤링 재시작으로 죽자 터널이 끊겼고, kubectl은 다른 살아있는 파드로
+자동 재연결하지 않습니다 (프로세스를 새로 띄워야 함). 즉 이 "다운타임"은 **클러스터의
+실제 가용성이 아니라 `port-forward`의 알려진 한계**를 측정한 것입니다.
+
+**올바른 측정 방법**: (1) 재시작 대상이 아닌 안정적인 파드에서 `kubectl exec`로 반복
+쿼리하거나, (2) 매 요청마다 새로 연결하는(reconnect) 클라이언트를 쓰거나, (3) 실제
+운영에서는 커넥션 풀 + 재시도 로직이 있는 드라이버를 사용해야 합니다. 7-1절/10절의
+장애 실험에서 `kubectl exec` 기반으로 측정했을 때는 Distributed 테이블이 개별 레플리카
+장애를 정상적으로 우회했음을 이미 확인한 바 있습니다 — 롤링 업그레이드도 동일하게
+레플리카 단위로 순차 진행되므로, 같은 방식(안정된 파드에서 exec)으로 다시 측정하면
+실제 다운타임은 훨씬 낮을 것으로 예상됩니다. (이번 세션에서는 시간 관계상 재측정하지
+않음 — 다음 실험 후보로 남겨둠.)
+
+### 13-4. 핵심 정리
+
+| 항목 | 결과 |
+|---|---|
+| 다운그레이드 (26.8→24.8) | 실패 (CrashLoopBackOff) — 온디스크 포맷 비호환, 공식 미지원 |
+| 업그레이드 (26.8.2.7→26.9.1.510) | 성공, 데이터 유실 없음 (13004행 그대로) |
+| 롤아웃 방식 | 순차적 (1~2개씩), 12파드에 약 55분 |
+| 가용성 측정 | `port-forward` 기반 측정은 신뢰 불가 (파드 고정 문제) — `exec` 기반 재측정 필요 |
+
+---
+
+## 14. 접속 (호스트에서 직접 붙어보기)
 
 ```bash
 kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/clickhouse-chi 8123:8123 9000:9000
@@ -776,7 +882,7 @@ curl 'http://localhost:8123/?query=SELECT%201'
 
 ---
 
-## 14. 정리
+## 15. 정리
 
 ```bash
 kind delete cluster --name clickhouse-lab
