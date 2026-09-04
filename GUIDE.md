@@ -1140,7 +1140,143 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 
 
 ---
 
-## 16. 접속 (호스트에서 직접 붙어보기)
+## 16. 네트워크 파티션 (스플릿 브레인) 시뮬레이션
+
+> ⚠️ **이 실험은 지금까지 중 가장 리스크가 높습니다.** 노드 레벨에서 iptables 규칙을
+> 직접 조작하므로, 규칙을 걷어내는 명령을 미리 적어두고 파티션 유지 시간을 짧게
+> (수십 초 단위) 제한한 뒤 곧바로 원복 → 연결 확인 → 클러스터 헬스체크까지 마친
+> 다음에야 분석/기록으로 넘어가는 규율을 지켰습니다. kind 클러스터가 아닌 실제
+> 운영 환경에서는 훨씬 신중하게, 가능하면 카오스 엔지니어링 전용 도구(Chaos Mesh
+> 등)로 하시길 권합니다.
+
+10절("Keeper 노드 장애 내성 테스트")은 `SYSTEM STOP MERGES` 대신 파드를 아예
+0으로 스케일해 Keeper 프로세스 자체를 죽이는 방식이었습니다. 이번엔 **프로세스는
+살아있는 채로 네트워크만 끊어서**, Keeper의 Raft 합의가 진짜 스플릿 브레인
+상황에서 어떻게 동작하는지 — 그리고 파티션이 풀렸을 때 10절과 달리 **사람이 개입할
+필요 없이 저절로 재합류**하는지를 확인합니다.
+
+### 16-1. 왜 `NetworkPolicy`가 아니라 `iptables`인가
+
+kind의 기본 CNI인 kindnet은 Kubernetes `NetworkPolicy` 오브젝트를 지원하지
+않습니다. 대신 kind의 각 노드는 그 자체로 하나의 Docker 컨테이너이자 독립된
+Linux 네트워크 네임스페이스이므로, **노드 컨테이너 안에서 직접 `iptables`
+규칙을 걸면 그 노드를 오가는 파드 트래픽을 실제로 차단**할 수 있습니다
+(kindest/node 이미지에는 kube-proxy가 쓰는 `iptables`가 이미 포함돼 있습니다).
+
+### 16-2. 토폴로지 확인 — 딱 맞는 2:1 분할이 가능한 배치
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse get pods -o wide | grep keeper
+kubectl --context kind-clickhouse-lab get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'
+```
+
+Keeper 3개 파드가 마침 `chk-chk-keeper-0-0`/`-0-1`은 `worker2`(파드 CIDR
+`10.244.3.0/24`)에, `chk-chk-keeper-0-2`는 `worker3`(`10.244.1.0/24`)에
+떠 있었습니다. 두 노드 사이의 파드 트래픽만 막으면 자연스럽게 **다수파
+2개(0-0, 0-1) vs 소수파 1개(0-2)**로 갈라집니다.
+
+### 16-3. 파티션 적용 → 관찰 → 즉시 원복 (전체 12초 안에)
+
+```bash
+# 제거 명령을 미리 적어둔 뒤 적용 (양방향, 양쪽 노드 모두)
+docker exec clickhouse-lab-worker2 iptables -I FORWARD -s 10.244.1.0/24 -d 10.244.3.0/24 -j DROP
+docker exec clickhouse-lab-worker2 iptables -I FORWARD -s 10.244.3.0/24 -d 10.244.1.0/24 -j DROP
+docker exec clickhouse-lab-worker3 iptables -I FORWARD -s 10.244.3.0/24 -d 10.244.1.0/24 -j DROP
+docker exec clickhouse-lab-worker3 iptables -I FORWARD -s 10.244.1.0/24 -d 10.244.3.0/24 -j DROP
+
+# 실제로 끊겼는지 확인 (타임아웃이 나야 정상)
+kubectl --context kind-clickhouse-lab -n clickhouse exec chk-chk-keeper-0-2-0 -- sh -c "nc -zv -w2 10.244.3.20 2181"
+
+# 양쪽의 Keeper 4-letter-word 상태 확인 (ZooKeeper와 동일한 mntr 인터페이스)
+kubectl --context kind-clickhouse-lab -n clickhouse exec chk-chk-keeper-0-0-0 -- sh -c "echo mntr | nc -w2 127.0.0.1 2181"
+kubectl --context kind-clickhouse-lab -n clickhouse exec chk-chk-keeper-0-2-0 -- sh -c "echo mntr | nc -w2 127.0.0.1 2181"
+
+# 다수파를 거쳐 쓰기가 되는지 확인
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q \
+  "INSERT INTO events_local VALUES (999001, now(), 'partition-test-majority')"
+
+# 곧바로 규칙 제거
+docker exec clickhouse-lab-worker2 iptables -D FORWARD -s 10.244.1.0/24 -d 10.244.3.0/24 -j DROP
+docker exec clickhouse-lab-worker2 iptables -D FORWARD -s 10.244.3.0/24 -d 10.244.1.0/24 -j DROP
+docker exec clickhouse-lab-worker3 iptables -D FORWARD -s 10.244.3.0/24 -d 10.244.1.0/24 -j DROP
+docker exec clickhouse-lab-worker3 iptables -D FORWARD -s 10.244.1.0/24 -d 10.244.3.0/24 -j DROP
+```
+
+**실측 결과 (예상과 다르게 흥미로웠던 지점)**: 파티션을 걸기 직전 우연히
+**리더가 소수파 쪽(`keeper-0-2`)**에 있었습니다. 파티션 후 12초라는 짧은
+관찰 창 안에서:
+
+- 다수파(`keeper-0-0`, `keeper-0-1`)는 `mntr`이 `"This instance is not
+  currently serving requests"`를 반환 — 리더를 잃고 새 리더를 선출하는
+  중이라 아직 요청을 못 받는 상태.
+- 소수파(`keeper-0-2`)는 여전히 `zk_server_state: leader`, `zk_followers: 2`,
+  `zk_synced_followers: 2`로 자기 자신을 정상 리더라고 보고 — 팔로워 단절을
+  아직 감지하지 못한 찰나의 "가짜 리더" 상태였습니다(하트비트 타임아웃이
+  아직 안 지났기 때문으로 추정).
+- 그럼에도 `chi-chi-cluster1-0-0-0`(파티션에 걸리지 않은 `worker` 노드)을
+  통한 쓰기는 **성공**했습니다.
+
+즉, 명확하게 "다수파만 쓰기 가능, 소수파는 즉시 실패"라는 교과서적인 결과가
+아니라, **선출 유예(election grace period) 동안에는 경계가 순간적으로
+모호할 수 있다**는 걸 있는 그대로 확인했습니다. 파티션이 조금이라도 더 길게
+지속됐다면 소수파도 곧 팔로워 감지 타임아웃에 걸려 리더 자격을 잃었을
+것입니다.
+
+### 16-4. 원복 후 자동 자가치유 확인 (핵심 발견)
+
+```bash
+# 연결 복구 확인
+kubectl --context kind-clickhouse-lab -n clickhouse exec chk-chk-keeper-0-2-0 -- sh -c "nc -zv -w2 10.244.3.20 2181"
+
+# 모든 keeper의 상태를 다시 확인 — 수동 개입 없이 자동으로 정리됐는지
+for pod in chk-chk-keeper-0-0-0 chk-chk-keeper-0-1-0 chk-chk-keeper-0-2-0; do
+  kubectl --context kind-clickhouse-lab -n clickhouse exec $pod -- sh -c "echo mntr | nc -w2 127.0.0.1 2181" | grep zk_server_state
+done
+```
+
+**결과**: 규칙 제거 후 곧바로(5초 대기 후 확인) — `keeper-0-0`이 새 리더로
+정착(`zk_followers: 2`, `zk_synced_followers: 2`), `keeper-0-1`과 예전에
+"가짜 리더"였던 `keeper-0-2`는 둘 다 자연스럽게 `follower`로 안착했습니다.
+**아무 명령도 실행하지 않았는데** 3노드 Raft 앙상블이 스스로 재합류한
+것입니다.
+
+이는 10절의 "파드를 0으로 스케일"(=프로세스 자체가 사라짐) 실험과 명확히
+대비됩니다:
+
+| | 10절: 파드 스케일 0 (프로세스 종료) | 16절: 네트워크 파티션 (프로세스는 생존) |
+|---|---|---|
+| 장애 유형 | 프로세스/디스크 상태 소실 가능 | 통신만 두절, 로컬 상태는 그대로 |
+| 복구에 필요한 것 | 파드 재생성(자동) + 필요 시 수동 재등록 | **아무것도 필요 없음** — Raft가 스스로 재합류 |
+| 소수파의 착각 가능성 | 없음(그냥 죽어 있음) | 있음 — 짧은 창에서 "가짜 리더" 상태 관찰됨 |
+
+### 16-5. 사후 검증 및 정리
+
+파티션/복구 전 과정에서 클러스터가 완전히 정상인지 최종 확인:
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "SELECT count() FROM system.clusters WHERE cluster='cluster1'"   # 12
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "SELECT count() FROM events"   # 8671 (기존 8670 + 파티션 중 쓴 테스트 행 1개)
+```
+
+테스트 중 삽입한 `id=999001` 행은 "파티션 중 다수파를 통한 쓰기가 실제로
+유실 없이 살아남았다"는 증거로 그대로 남겨뒀습니다 (`payload =
+'partition-test-majority'`로 식별 가능).
+
+### 16-6. 핵심 정리
+
+| 항목 | 결과 |
+|---|---|
+| 파티션 도구 | kind 노드 컨테이너 안에서 `iptables FORWARD` 규칙 (kindnet은 `NetworkPolicy` 미지원) |
+| 분할 | Keeper 2(다수) vs 1(소수), 노드 배치를 이용해 깔끔하게 분리 |
+| 관찰 창 | 총 12초 (안전을 위해 최소화) |
+| 소수파 동작 | 짧은 창에서는 "가짜 리더" 상태가 관찰될 수 있음 (하트비트 타임아웃 전) |
+| 다수파 쓰기 | 성공 (데이터 유실 없음) |
+| 파티션 해제 후 | **수동 개입 없이** Raft가 자동으로 재합류 — 10절(프로세스 종료)과의 핵심 차이 |
+| 데이터 정합성 | `system.clusters` 12, `events` 8671행으로 최종 정상 확인 |
+
+---
+
+## 17. 접속 (호스트에서 직접 붙어보기)
 
 ```bash
 kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/clickhouse-chi 8123:8123 9000:9000
@@ -1152,7 +1288,7 @@ curl 'http://localhost:8123/?query=SELECT%201'
 
 ---
 
-## 17. 정리
+## 18. 정리
 
 ```bash
 kind delete cluster --name clickhouse-lab
