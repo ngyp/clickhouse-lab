@@ -870,7 +870,157 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 
 
 ---
 
-## 14. 접속 (호스트에서 직접 붙어보기)
+## 14. 부하 테스트 & `max_parallel_replicas` 실험
+
+`max_parallel_replicas`는 **같은 샤드 안의 여러 레플리카**가 하나의 쿼리를 나눠서 함께
+스캔하게 만드는 설정입니다(레플리카를 "여분"이 아니라 "추가 연산력"으로 활용). 실제
+효과가 있는지 `clickhouse-benchmark`로 직접 측정합니다.
+
+### 14-1. 벤치마크용 데이터셋 준비
+
+기존 `events` 테이블(13,004행)은 스캔이 거의 즉시 끝나 병렬화 효과를 볼 수 없으므로,
+스캔 부하가 확실히 걸리는 별도 테이블에 1,000만 행을 새로 적재합니다.
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+CREATE TABLE bench_local ON CLUSTER 'cluster1'
+(
+    id UInt64,
+    category LowCardinality(String),
+    val1 Float64,
+    val2 Float64,
+    payload String
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/bench_local', '{replica}')
+ORDER BY id
+"
+
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+CREATE TABLE bench ON CLUSTER 'cluster1' AS bench_local
+ENGINE = Distributed('cluster1', currentDatabase(), bench_local, rand())
+"
+
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client --max_insert_threads=4 -q "
+INSERT INTO bench
+SELECT
+    number AS id,
+    ['electronics','books','clothing','toys','food','sports','tools','music'][(number % 8) + 1] AS category,
+    sin(number) * 1000 AS val1,
+    cos(number) * 1000 AS val2,
+    hex(number) || repeat('x', 40) AS payload
+FROM numbers(10000000)
+"
+```
+
+결과: 4샤드에 걸쳐 총 1,000만 행(샤드당 약 250만 행), 압축 후 샤드당 디스크 사용량은
+약 62MB — 2Gi PVC 대비 여유롭습니다.
+
+### 14-2. `enable_parallel_replicas` — 이 버전(26.9)의 실제 설정 이름
+
+이 버전에서 `max_parallel_replicas`는 **기본값이 이미 1000**입니다. 하지만 실제로
+병렬 읽기를 켜는 스위치는 `enable_parallel_replicas`(과거 이름
+`allow_experimental_parallel_reading_from_replicas`)이고 기본값은 `0`(꺼짐)입니다.
+즉 `max_parallel_replicas`만 지정해서는 아무 효과가 없고, 반드시
+`enable_parallel_replicas=1`을 함께 켜야 합니다.
+
+```sql
+SELECT name, value, description FROM system.settings WHERE name ILIKE '%parallel_replicas%'
+```
+
+**주의할 함정**: 로컬 테이블(`bench_local`)에 직접 이 설정을 걸면 다음 에러가 납니다.
+
+```
+Code: 701. Reading in parallel from replicas is enabled but cluster to execute
+query is not provided. Please set 'cluster_for_parallel_replicas' setting.
+```
+
+그런데 `cluster_for_parallel_replicas='cluster1'`을 지정하면 또 다른 에러가 납니다.
+
+```
+Code: 714. `cluster_for_parallel_replicas` setting refers to cluster with 4
+shards. Expected a cluster with one shard.
+```
+
+`cluster_for_parallel_replicas`는 **샤드 1개짜리** 클러스터 정의(그 샤드의 레플리카들만
+나열)를 기대하는데, 우리 `cluster1`은 4샤드짜리라 쓸 수 없습니다. 해결책은 **Distributed
+테이블(`bench`)에 대고 쿼리하는 것** — Distributed 엔진이 이미 `cluster1`을 알고 있으므로
+`cluster_for_parallel_replicas` 없이 `enable_parallel_replicas=1`, `max_parallel_replicas=3`
+만 지정하면 됩니다. 그러면 각 샤드로의 팬아웃 각각이 자기 샤드 안의 3개 레플리카로
+다시 병렬화됩니다.
+
+```sql
+SELECT category, count(), avg(val1), avg(val2), sum(length(payload))
+FROM bench WHERE val1 > 0 GROUP BY category
+SETTINGS enable_parallel_replicas=1, max_parallel_replicas=3
+```
+
+### 14-3. 병렬 읽기가 실제로 발동했는지 증거로 확인
+
+`system.query_log`는 노드별 로컬 로그라, 같은 `initial_query_id`로 각 노드에 몇 개의
+서브쿼리 로그가 남았는지 세어보면 어느 레플리카가 실제로 일을 했는지 알 수 있습니다.
+
+```bash
+for pod in chi-chi-cluster1-0-0-0 chi-chi-cluster1-0-1-0 chi-chi-cluster1-0-2-0; do
+  kubectl --context kind-clickhouse-lab -n clickhouse exec $pod -- clickhouse-client -q "SYSTEM FLUSH LOGS"
+  kubectl --context kind-clickhouse-lab -n clickhouse exec $pod -- clickhouse-client -q \
+    "SELECT count() FROM system.query_log WHERE initial_query_id='<쿼리ID>'"
+done
+```
+
+**실측 결과**: 샤드0의 나머지 두 레플리카(`0-1`, `0-2`)에도 각각 2건씩 로그가 남아있어,
+평소라면 초기화 쿼리를 실행한 `0-0` 혼자 처리했을 일을 실제로 3개 레플리카가 나눠서
+처리했음을 확인했습니다. **기능 자체는 정상 작동합니다.**
+
+### 14-4. 성능 비교 — 그러나 오히려 느려짐
+
+```bash
+# 기본(병렬 없음)
+clickhouse-benchmark -i 60 -c 2 --query "SELECT category, count(), avg(val1), avg(val2), sum(length(payload)) FROM bench WHERE val1 > 0 GROUP BY category"
+
+# enable_parallel_replicas=1, max_parallel_replicas=3
+clickhouse-benchmark -i 60 -c 2 --query "... SETTINGS enable_parallel_replicas=1, max_parallel_replicas=3"
+```
+
+| 설정 | QPS | p50 | p90 | p99 |
+|---|---|---|---|---|
+| 기본 (병렬 없음) | 18.43 | 96ms | 138ms | 206ms |
+| `enable_parallel_replicas=1`, `max_parallel_replicas=3` | 14.01 | 132ms | 154ms | 190ms |
+
+동시성을 8로 올리고 쿼리를 더 무겁게(`uniqExact` 추가)해서 재측정해도 같은 경향이
+재현됩니다.
+
+| 설정 (동시성 8, 무거운 쿼리) | QPS | p50 | p99 |
+|---|---|---|---|
+| 기본 | 10.84 | 717ms | 1319ms |
+| 병렬 레플리카 ON | 7.64 | 1050ms | 1437ms |
+
+**결론: 이 환경에서는 `max_parallel_replicas`가 오히려 성능을 떨어뜨립니다.** 억지로
+긍정적 결과를 만들지 않고 있는 그대로 보고합니다. 원인으로 추정되는 것:
+
+1. **데이터 규모가 너무 작음** — 레플리카 1개가 담당하는 몫이 샤드당 250만 행(약
+   15MB 압축 컬럼)뿐이라, 단일 스레드로도 100ms 안팎이면 끝남. 병렬화로 아낄 수 있는
+   시간보다 레플리카 간 작업 분배·결과 병합에 드는 **조율 오버헤드**가 더 큼.
+2. **레플리카들이 진짜 별도 하드웨어가 아님** — 이 랩의 12개 ClickHouse 파드는 모두
+   `kind` 워커 노드(컨테이너)이고, 그 워커 노드들은 결국 **하나의 Colima VM(6 vCPU)**을
+   나눠 쓰고 있습니다. 즉 "병렬" 레플리카가 실제로는 같은 물리 코어를 두고 경쟁하는
+   셈이라, 진짜 멀티노드 클러스터에서 기대할 수 있는 병렬 처리 이득이 나타나지 않습니다.
+
+`max_parallel_replicas`는 **레플리카당 스캔량이 충분히 크고(수억~수십억 행), 레플리카가
+실제로 분리된 하드웨어/코어를 가진** 상황에서 의미가 있는 기능이며, 이런 로컬 랩
+환경에서 검증하기에는 태생적으로 불리한 실험이라는 점이 이번 실험의 정직한 결론입니다.
+
+### 14-5. 정리
+
+실험 전용 테이블은 이후 실험에 재사용하지 않으므로 삭제해 PVC 공간을 반환했습니다.
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "DROP TABLE IF EXISTS bench ON CLUSTER 'cluster1' SYNC"
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "DROP TABLE IF EXISTS bench_local ON CLUSTER 'cluster1' SYNC"
+```
+
+---
+
+## 15. 접속 (호스트에서 직접 붙어보기)
 
 ```bash
 kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/clickhouse-chi 8123:8123 9000:9000
@@ -882,7 +1032,7 @@ curl 'http://localhost:8123/?query=SELECT%201'
 
 ---
 
-## 15. 정리
+## 16. 정리
 
 ```bash
 kind delete cluster --name clickhouse-lab
