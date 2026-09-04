@@ -1020,7 +1020,127 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 
 
 ---
 
-## 15. 접속 (호스트에서 직접 붙어보기)
+## 15. Mutation & TTL 라이프사이클
+
+`ALTER TABLE ... UPDATE/DELETE`(mutation)와 TTL 만료가 `ReplicatedMergeTree` 클러스터
+전체에 어떻게 전파되는지, 그리고 TTL이 "시간이 되면 즉시" 지워지는 게 아니라
+**병합(merge) 시점에만 평가**된다는 사실을 직접 확인합니다.
+
+### 15-1. Mutation 전파 (비동기 vs 동기)
+
+```bash
+# 비동기(기본값) UPDATE — 즉시 리턴, 백그라운드에서 진행
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+ALTER TABLE events_local ON CLUSTER 'cluster1' UPDATE payload = concat('updated-', toString(id)) WHERE id % 3 = 0
+"
+
+# system.mutations를 폴링하며 진행 상황 관찰 (모든 파드에서 is_done=1 될 때까지)
+for pod in chi-chi-cluster1-{0,1,2,3}-{0,1,2}-0; do
+  kubectl --context kind-clickhouse-lab -n clickhouse exec $pod -- clickhouse-client -q \
+    "SELECT count() FROM system.mutations WHERE table='events_local' AND NOT is_done"
+done
+
+# 동기(mutations_sync=2) UPDATE — 클러스터 전체 완료까지 클라이언트가 블로킹
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+ALTER TABLE events_local ON CLUSTER 'cluster1' UPDATE payload = concat('updated2-', toString(id)) WHERE id % 3 = 1
+SETTINGS mutations_sync=2
+"
+
+# DELETE도 동일하게 mutation 큐를 거침 (즉시 삭제가 아님)
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+ALTER TABLE events_local ON CLUSTER 'cluster1' DELETE WHERE id % 3 = 2
+"
+```
+
+**확인된 결과**: 3개 mutation(`UPDATE` 비동기, `UPDATE ... SETTINGS mutations_sync=2`,
+`DELETE`) 모두 `system.mutations.is_done=1`로 12개 파드 전체에서 완료됨을 확인했습니다.
+`mutations_sync=2`는 클라이언트 명령 자체가 클러스터 전체 완료까지 블로킹된다는 점이
+비동기 방식(명령은 즉시 리턴하고 `system.mutations`를 폴링해서 완료를 확인)과 다릅니다.
+DELETE 후 `SELECT count() FROM events`는 8670행으로, 삭제 대상(`id % 3 = 2`)만큼
+정확히 줄어든 것을 확인했습니다.
+
+### 15-2. TTL은 "시간이 되면 자동으로" 지워지지 않는다
+
+TTL 만료는 **백그라운드 병합이 그 파트를 건드릴 때만** 평가됩니다. 계속 스캔하며
+지우는 별도 프로세스가 있는 게 아닙니다. 이를 명확히 보려고 실제 서비스 데이터
+(`events`/`events_local`, 며칠에 걸쳐 삽입된 `event_time` 값들)를 건드리지 않고
+전용 테스트 테이블로 시연했습니다.
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+CREATE TABLE ttl_demo_local ON CLUSTER 'cluster1'
+(
+    id UInt64,
+    inserted_at DateTime
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/ttl_demo_local', '{replica}')
+ORDER BY id
+TTL inserted_at + INTERVAL 30 SECOND
+"
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+CREATE TABLE ttl_demo ON CLUSTER 'cluster1' AS ttl_demo_local
+ENGINE = Distributed('cluster1', currentDatabase(), ttl_demo_local, rand())
+"
+
+# 이미 TTL 기준(30초)을 넘겨 "만료된 채로" 태어나는 행 4개 + 방금 삽입된 신선한 행 1개
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "
+INSERT INTO ttl_demo_local VALUES
+  (1, now() - INTERVAL 1 MINUTE), (2, now() - INTERVAL 1 MINUTE),
+  (3, now() - INTERVAL 1 MINUTE), (4, now() - INTERVAL 1 MINUTE),
+  (5, now())
+"
+```
+
+30초는 물론이고 **10분 넘게 기다려도** 만료된 4개 행이 그대로 남아있었습니다 — 파트가
+1개뿐이라 배경 병합이 일어날 대상이 없었기 때문입니다. `OPTIMIZE TABLE ... FINAL`을
+실행해도 사라지지 않는 걸 추가로 확인했는데, 이는 ClickHouse가 파티션에 파트가
+이미 1개뿐이면 "이미 최적화됨"으로 보고 실제 재작성(및 그에 딸린 TTL 재평가)을
+건너뛰기 때문입니다(`optimize_skip_merged_partitions` 기본 동작). TTL을 확실히 강제
+평가하려면 `ALTER TABLE ... MATERIALIZE TTL`을 써야 합니다:
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q \
+  "ALTER TABLE ttl_demo_local ON CLUSTER 'cluster1' MATERIALIZE TTL"
+
+# system.mutations로 완료 확인 (이것도 mutation 큐를 거침)
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q \
+  "SELECT is_done, parts_to_do FROM system.mutations WHERE table='ttl_demo_local'"
+
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "SELECT * FROM ttl_demo_local ORDER BY inserted_at"
+```
+
+**실측 결과**: `MATERIALIZE TTL` 실행 후 `is_done=1`로 완료되자마자, 만료됐던 4개 행은
+사라지고 신선한 행만 남았습니다(파트가 `rows=0`으로 재작성됨). 즉:
+
+- TTL은 "만료 시각이 지나면 즉시" 적용되는 게 아니라, **병합(또는 `MATERIALIZE TTL`
+  mutation)이 그 데이터를 실제로 건드릴 때** 비로소 적용됩니다.
+- 파트가 이미 1개뿐인 작은 테이블에서는 `OPTIMIZE ... FINAL`조차 지름길로 판단되어
+  아무 일도 하지 않을 수 있습니다 — 이럴 땐 `MATERIALIZE TTL`이 확실한 방법입니다.
+- 실서비스에서 배경 병합이 자주 도는 큰 테이블은 이런 지연이 몇 분~병합 주기 안에
+  자연스럽게 해소되지만, 삽입이 뜸한 작은 테이블/파티션에서는 만료된 데이터가
+  예상보다 훨씬 오래(관찰상 10분 이상) 남아있을 수 있다는 점을 실무에서 유의해야
+  합니다.
+
+### 15-3. 정리
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "DROP TABLE IF EXISTS ttl_demo ON CLUSTER 'cluster1' SYNC"
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- clickhouse-client -q "DROP TABLE IF EXISTS ttl_demo_local ON CLUSTER 'cluster1' SYNC"
+```
+
+### 15-4. 핵심 정리
+
+| 항목 | 결과 |
+|---|---|
+| 비동기 mutation | 명령 즉시 리턴, `system.mutations.is_done`을 폴링해 완료 확인 (12개 파드 전체 확인) |
+| 동기 mutation (`mutations_sync=2`) | 클라이언트가 클러스터 전체 완료까지 블로킹 |
+| DELETE mutation | 동일하게 mutation 큐 경유, 즉시 삭제 아님 |
+| TTL 만료 트리거 | 오직 병합(또는 `MATERIALIZE TTL`) 시점에만 평가 — 시간 경과만으로는 지워지지 않음 |
+| 단일 파트 테이블의 함정 | `OPTIMIZE ... FINAL`도 건너뛸 수 있음 → `MATERIALIZE TTL`이 확실한 강제 수단 |
+
+---
+
+## 16. 접속 (호스트에서 직접 붙어보기)
 
 ```bash
 kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/clickhouse-chi 8123:8123 9000:9000
@@ -1032,7 +1152,7 @@ curl 'http://localhost:8123/?query=SELECT%201'
 
 ---
 
-## 16. 정리
+## 17. 정리
 
 ```bash
 kind delete cluster --name clickhouse-lab
