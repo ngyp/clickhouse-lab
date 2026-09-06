@@ -8,10 +8,197 @@ data:
     apiVersion: 1
     datasources:
       - name: Prometheus
+        uid: prometheus-ds
         type: prometheus
         access: proxy
         url: http://prometheus.clickhouse.svc:9090
         isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: clickhouse
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: clickhouse
+data:
+  clickhouse-overview.json: |
+    {
+      "title": "ClickHouse Lab Overview",
+      "uid": "clickhouse-lab-overview",
+      "schemaVersion": 39,
+      "version": 1,
+      "editable": true,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "CH Pods Up",
+          "type": "stat",
+          "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "sum(up{job=\"clickhouse-pods\"})", "refId": "A" }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 12 }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 2,
+          "title": "Operator Up",
+          "type": "stat",
+          "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "up{job=\"clickhouse-operator\"}", "refId": "A" }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 3,
+          "title": "Readonly Replicas (should be 0)",
+          "type": "stat",
+          "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "sum(ClickHouseMetrics_ReadonlyReplica)", "refId": "A" }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 4,
+          "title": "ZooKeeper/Keeper Sessions (should equal pod count)",
+          "type": "stat",
+          "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "sum(ClickHouseMetrics_ZooKeeperSession)", "refId": "A" }
+          ]
+        },
+        {
+          "id": 5,
+          "title": "Cluster Topology (ClickHouse_Info)",
+          "type": "table",
+          "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            {
+              "expr": "ClickHouse_Info",
+              "refId": "A",
+              "format": "table",
+              "instant": true
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "Value": true,
+                  "__name__": true,
+                  "instance": true,
+                  "job": true,
+                  "name": true
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "title": "Background Activity (cluster-wide totals)",
+          "type": "timeseries",
+          "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "sum(ClickHouseMetrics_Merge)", "legendFormat": "active merges", "refId": "A" },
+            { "expr": "sum(ClickHouseMetrics_PartMutation)", "legendFormat": "active mutations", "refId": "B" },
+            { "expr": "sum(ClickHouseMetrics_ReplicatedFetch)", "legendFormat": "replicated fetches", "refId": "C" }
+          ]
+        },
+        {
+          "id": 7,
+          "title": "Query Rate per Pod (QPS)",
+          "type": "timeseries",
+          "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "rate(ClickHouseProfileEvents_Query[1m])", "legendFormat": "{{pod}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 8,
+          "title": "Parts by State (all tables, cluster-wide)",
+          "type": "timeseries",
+          "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "sum by (part_state) (ClickHouseDimensionalMetrics_merge_tree_parts)", "legendFormat": "{{part_state}}", "refId": "A" }
+          ]
+        },
+        {
+          "id": 9,
+          "title": "Operator-observed Query Events by Host",
+          "type": "timeseries",
+          "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus-ds" },
+          "targets": [
+            { "expr": "rate(chi_clickhouse_event_Query[5m])", "legendFormat": "{{hostname}}", "refId": "A" }
+          ]
+        }
+      ]
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -50,10 +237,20 @@ spec:
           volumeMounts:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
       volumes:
         - name: datasources
           configMap:
             name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
 ---
 apiVersion: v1
 kind: Service

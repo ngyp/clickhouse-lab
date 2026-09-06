@@ -637,7 +637,167 @@ curl -s http://localhost:3000/api/datasources/uid/<uid>/health
 
 ---
 
-## 12. 클러스터 확장 & 리샤딩 (3→4 샤드)
+## 12. 가시성 (Observability)
+
+11절에서 Prometheus/Grafana를 **배포**했다면, 이 절은 실제로 클러스터 상태를
+**어떻게 들여다보는지** 다룹니다. 지금까지 실험 곳곳에서 즉흥적으로 썼던
+`system.*` 쿼리들을 한곳에 정리하고, 실제로 동작하는 Grafana 대시보드를 붙이고,
+"정상 vs 이상"을 판별하는 기준을 이 랩에서 실제로 관찰한 사례에 근거해 정리합니다.
+
+### 12-1. `system.*` 쿼리 치트시트
+
+아래 쿼리는 모두 재구축된 라이브 클러스터(4샤드×3레플리카)에서 직접 실행해
+확인했습니다.
+
+**클러스터 토폴로지**
+
+```sql
+-- 샤드/레플리카 구성 한눈에 보기
+SELECT cluster, shard_num, replica_num, host_name
+FROM system.clusters WHERE cluster='cluster1' ORDER BY shard_num, replica_num;
+```
+
+**복제 상태 (레플리카 헬스체크의 핵심)**
+
+```sql
+-- is_readonly=1이면 Keeper 연결 문제, active_replicas < total_replicas면 일부 레플리카 다운
+SELECT database, table, replica_name, is_readonly, is_session_expired,
+       active_replicas, total_replicas, log_pointer, log_max_index
+FROM system.replicas;
+
+-- 아직 처리되지 않은 복제 작업(fetch/merge/mutation) 큐 — 쌓이면 복제 지연 신호
+SELECT count() FROM system.replication_queue;
+
+-- 활성 파트에서 떨어져 나간(detached) 파트 — 정상 상태면 0
+SELECT count() FROM system.detached_parts;
+```
+
+**Mutation / Merge 진행 상황**
+
+```sql
+-- 진행 중인 mutation (is_done=0이 오래 지속되면 이상 신호)
+SELECT database, table, mutation_id, command, is_done, parts_to_do
+FROM system.mutations WHERE NOT is_done;
+
+-- 현재 실행 중인 병합
+SELECT count() FROM system.merges;
+
+-- 테이블별 활성 파트 수 (작은 파트가 과도하게 많으면 병합이 밀리고 있다는 신호)
+SELECT table, count() AS parts, sum(rows) AS rows
+FROM system.parts WHERE active GROUP BY table;
+```
+
+**쿼리 활동 / 저장공간**
+
+```sql
+-- 최근 5분간 처리한 쿼리 수
+SELECT count() FROM system.query_log WHERE event_time > now() - INTERVAL 5 MINUTE;
+
+-- 디스크 여유 공간 (PVC 용량 대비 사용량 확인)
+SELECT name, path, free_space, total_space FROM system.disks;
+```
+
+**Keeper(ZooKeeper) 연결 상태**
+
+```sql
+-- 이 노드가 Keeper와 맺은 세션 상태 (session_uptime_elapsed_seconds, xid 등)
+SELECT * FROM system.zookeeper_connection;
+```
+
+### 12-2. Grafana 대시보드 실제 구성
+
+`manifests/monitoring/grafana.yaml`에 대시보드 프로비저닝을 추가했습니다.
+Grafana의 파일 기반 프로비저닝은 두 계층으로 나뉩니다 — provider 설정(어느
+폴더를 감시할지)과 실제 대시보드 JSON(그 폴더 안의 파일):
+
+```yaml
+# grafana-dashboard-provider ConfigMap → /etc/grafana/provisioning/dashboards
+apiVersion: 1
+providers:
+  - name: default
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+
+# grafana-dashboards ConfigMap → /var/lib/grafana/dashboards (실제 JSON)
+```
+
+패널을 만들기 전에 Prometheus가 실제로 어떤 메트릭을 노출하는지 먼저 확인했습니다
+(추측하지 않고 `label/__name__/values`로 직접 조회):
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/prometheus 9090:9090 &
+curl -s http://localhost:9090/api/v1/label/__name__/values | jq -r '.data[]' | grep ^ClickHouseMetrics_ | head
+```
+
+ClickHouse 익스포터의 "현재값(gauge)" 계열 메트릭은 문서에 자주 나오는
+`ClickHouseMetric_*`가 아니라 **`ClickHouseMetrics_*`**(끝에 s)였습니다 —
+실제로 조회해보지 않았다면 놓쳤을 부분입니다. 이걸 바탕으로 9개 패널을
+구성했고, 배포 전 모든 패널의 PromQL이 실제로 비어있지 않은 값을 반환하는지
+하나씩 확인했습니다:
+
+| 패널 | 쿼리 | 확인된 결과 |
+|---|---|---|
+| CH Pods Up | `sum(up{job="clickhouse-pods"})` | 12 |
+| Operator Up | `up{job="clickhouse-operator"}` | 1 |
+| Readonly Replicas | `sum(ClickHouseMetrics_ReadonlyReplica)` | 0 (정상) |
+| ZooKeeper/Keeper Sessions | `sum(ClickHouseMetrics_ZooKeeperSession)` | 12 (파드 수와 일치) |
+| Cluster Topology (표) | `ClickHouse_Info` | 12개 시계열, shard/replica/pod 라벨 포함 |
+| Background Activity | `sum(ClickHouseMetrics_Merge)` / `PartMutation` / `ReplicatedFetch` | 3개 라인, 클러스터 전체 합산 |
+| Query Rate per Pod | `rate(ClickHouseProfileEvents_Query[1m])` | 파드별 12개 라인 |
+| Parts by State | `sum by (part_state) (ClickHouseDimensionalMetrics_merge_tree_parts)` | 5개 상태(Active/Outdated 등) |
+| Operator Query Events by Host | `rate(chi_clickhouse_event_Query[5m])` | 오퍼레이터 경유, 호스트별 12개 라인 |
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/monitoring/grafana.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse rollout status deployment/grafana
+```
+
+프로비저닝 확인 (스크린샷 대신 API로):
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/grafana 3000:3000 &
+curl -s -u admin:admin http://localhost:3000/api/search?query=ClickHouse
+# => uid: clickhouse-lab-overview 대시보드가 검색됨
+curl -s -u admin:admin http://localhost:3000/api/dashboards/uid/clickhouse-lab-overview
+# => panels 배열에 9개 패널 모두 확인
+```
+
+브라우저에서는 `http://localhost:3000` 접속 후 "ClickHouse Lab Overview"
+대시보드를 열면 됩니다(익명 Admin 접속 허용, 또는 admin/admin).
+
+### 12-3. 장애/이상 징후 판별 기준
+
+아래 표는 일반 문서가 아니라 **이 랩에서 지금까지의 실험을 통해 실제로 관찰한**
+"정상 vs 이상" 신호입니다. 각 행은 해당 이상 징후를 실제로 만들어봤던 절을
+가리킵니다.
+
+| 신호 (쿼리/명령) | 정상일 때 | 이상 발생 시 실제 관찰 (해당 절) |
+|---|---|---|
+| `system.replicas.active_replicas` vs `total_replicas` | 두 값이 같음 | 레플리카가 디스크를 잃으면 `active_replicas < total_replicas`로 즉시 감소 (7-2절: PVC 삭제 실험) |
+| `system.replicas.is_readonly` | 0 | Keeper 쿼럼을 잃으면 해당 레플리카가 읽기 전용으로 전환되고, `ReplicatedMergeTree` 쓰기가 멈춤 (10절: Keeper 쿼럼 상실 실험) |
+| `system.mutations.is_done` + `parts_to_do` | 곧 1로 완료 | 배경 병합이 관리자에 의해 멈추면(`SYSTEM STOP MERGES`) mutation이 `is_done=0`으로 무기한 정체 (16절: Mutation & TTL 실험) |
+| `system.replication_queue` 건수 | 0에 가까움, 금방 소진 | 대량 mutation/리샤딩 직후 일시적으로 급증했다가 서서히 감소 (13절: 리샤딩 실험) |
+| `system.parts`의 테이블당 파트 수 | 적고 안정적 | 병합이 밀리면 작은 파트가 쌓임 — 단일 파트만 있는 작은 테이블은 `OPTIMIZE FINAL`조차 건너뛸 수 있다는 함정도 발견 (16절) |
+| Keeper `mntr`의 `zk_server_state` | 전체 앙상블에서 리더 1개 + 팔로워 나머지 정확히 일치 | 네트워크 파티션 중에는 소수파가 팔로워 단절을 아직 감지 못해 스스로를 "리더"라고 오보고하는 과도기 상태가 존재 (17절: 네트워크 파티션 실험) |
+| Grafana "Readonly Replicas" 패널 | 0 | 1 이상이면 즉시 조사 필요 — 위 `is_readonly` 신호를 대시보드로 상시 관찰하는 버전 |
+| Grafana "ZooKeeper/Keeper Sessions" 패널 | 파드 수(현재 12)와 일치 | 세션 수가 줄면 일부 노드가 Keeper와 연결이 끊겼다는 뜻 |
+
+### 12-4. 핵심 정리
+
+- `system.*` 쿼리는 "지금 이 순간의 스냅샷"에 강하고, Grafana는 "시간에 따른
+  추세"(병합이 밀리기 시작했다, 세션이 끊겼다 등)를 놓치지 않는 데 강함 — 둘을
+  같이 써야 함.
+- ClickHouse Prometheus 익스포터의 게이지 메트릭 prefix는 `ClickHouseMetrics_`
+  (문서에서 흔히 보이는 `ClickHouseMetric_` 단수형이 아님) — 실제 조회 없이
+  메트릭 이름을 추측하면 틀리기 쉬움.
+- 이 랩의 "이상 징후" 기준표는 추상적인 알람 규칙이 아니라, 실제로 그 문제를
+  일으켜보고 시스템 테이블에서 뭐가 바뀌는지 관찰한 결과입니다 — 장애주입
+  실험(7, 10, 16, 17절)이 관측 가능성 설계에 직접적인 근거를 제공한 셈입니다.
+
+---
+
+## 13. 클러스터 확장 & 리샤딩 (3→4 샤드)
 
 ClickHouse는 **샤드를 늘려도 기존 데이터를 자동으로 재분배하지 않습니다.** 샤딩은
 `Distributed` 테이블의 샤딩 키(`rand()`)가 "현재 샤드 개수"를 기준으로 매 INSERT 시점에
@@ -764,7 +924,7 @@ Distributed 총합도 13004로 리샤딩 전후 변화 없음 — 유실/중복 
 
 ---
 
-## 13. 무중단 롤링 업그레이드
+## 14. 무중단 롤링 업그레이드
 
 CHI에 `podTemplate`으로 명시적 이미지 태그를 지정하면, 오퍼레이터가 태그 변경을 감지해
 전체 클러스터를 순차적으로(rolling) 재기동합니다. `spec.configuration.clusters[].templates.podTemplate`로
@@ -870,7 +1030,7 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 
 
 ---
 
-## 14. 부하 테스트 & `max_parallel_replicas` 실험
+## 15. 부하 테스트 & `max_parallel_replicas` 실험
 
 `max_parallel_replicas`는 **같은 샤드 안의 여러 레플리카**가 하나의 쿼리를 나눠서 함께
 스캔하게 만드는 설정입니다(레플리카를 "여분"이 아니라 "추가 연산력"으로 활용). 실제
@@ -1020,7 +1180,7 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 
 
 ---
 
-## 15. Mutation & TTL 라이프사이클
+## 16. Mutation & TTL 라이프사이클
 
 `ALTER TABLE ... UPDATE/DELETE`(mutation)와 TTL 만료가 `ReplicatedMergeTree` 클러스터
 전체에 어떻게 전파되는지, 그리고 TTL이 "시간이 되면 즉시" 지워지는 게 아니라
@@ -1140,7 +1300,7 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 
 
 ---
 
-## 16. 네트워크 파티션 (스플릿 브레인) 시뮬레이션
+## 17. 네트워크 파티션 (스플릿 브레인) 시뮬레이션
 
 > ⚠️ **이 실험은 지금까지 중 가장 리스크가 높습니다.** 노드 레벨에서 iptables 규칙을
 > 직접 조작하므로, 규칙을 걷어내는 명령을 미리 적어두고 파티션 유지 시간을 짧게
@@ -1276,7 +1436,7 @@ kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 
 
 ---
 
-## 17. 접속 (호스트에서 직접 붙어보기)
+## 18. 접속 (호스트에서 직접 붙어보기)
 
 ```bash
 kubectl --context kind-clickhouse-lab -n clickhouse port-forward svc/clickhouse-chi 8123:8123 9000:9000
@@ -1288,7 +1448,7 @@ curl 'http://localhost:8123/?query=SELECT%201'
 
 ---
 
-## 18. 정리
+## 19. 정리
 
 ```bash
 kind delete cluster --name clickhouse-lab
