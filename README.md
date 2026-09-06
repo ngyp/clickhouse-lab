@@ -51,3 +51,8 @@ kubectl apply -f manifests/chi.yaml
 - 네트워크 파티션(스플릿 브레인) 시뮬레이션 — Keeper Raft의 자동 재합류 확인
 
 자세한 명령어와 결과는 [GUIDE.md](./GUIDE.md)에 정리돼 있습니다.
+
+## 프로덕션 운영 가이드
+
+이 랩에서의 실험 결과를 근거로, 실제 운영 환경에서 ClickHouse를 고성능·고가용으로
+운영하기 위한 설정/체크리스트는 **[PRODUCTION.md](./PRODUCTION.md)**를 참고하세요.
