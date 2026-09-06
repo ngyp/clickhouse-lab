@@ -59,3 +59,6 @@ kubectl apply -f manifests/chi.yaml
 
 이 랩 클러스터를 그 체크리스트에 대고 실제로 점검한 결과는
 **[AUDIT.md](./AUDIT.md)**에 정리돼 있습니다.
+
+PRODUCTION.md를 AWS(EKS + Altinity 오퍼레이터) 환경에 구체적으로 적용하는 방법은
+**[PRODUCTION-AWS.md](./PRODUCTION-AWS.md)**를 참고하세요.
