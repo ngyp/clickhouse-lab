@@ -56,3 +56,6 @@ kubectl apply -f manifests/chi.yaml
 
 이 랩에서의 실험 결과를 근거로, 실제 운영 환경에서 ClickHouse를 고성능·고가용으로
 운영하기 위한 설정/체크리스트는 **[PRODUCTION.md](./PRODUCTION.md)**를 참고하세요.
+
+이 랩 클러스터를 그 체크리스트에 대고 실제로 점검한 결과는
+**[AUDIT.md](./AUDIT.md)**에 정리돼 있습니다.
