@@ -62,3 +62,9 @@ kubectl apply -f manifests/chi.yaml
 
 PRODUCTION.md를 AWS(EKS + Altinity 오퍼레이터) 환경에 구체적으로 적용하는 방법은
 **[PRODUCTION-AWS.md](./PRODUCTION-AWS.md)**를 참고하세요.
+
+## 샘플 애플리케이션
+
+이 랩 클러스터 위에서 동작하는 ClickHouse + Java(Spring Boot) 표준 스켈레톤
+(앱 푸시 발송/클릭 로그 → Materialized View 기반 실시간 CTR 통계)은
+**[apps/push-click-service](./apps/push-click-service)**를 참고하세요.

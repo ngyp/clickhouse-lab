@@ -1,0 +1,31 @@
+spring:
+  application:
+    name: push-click-service
+
+server:
+  port: 8080
+
+# 로컬 개발 기본값: kind 랩 클러스터를 port-forward한 상태를 전제로 한다.
+#   kubectl --context kind-clickhouse-lab -n clickhouse port-forward --address 127.0.0.1 \
+#     svc/clickhouse-chi 18123:8123 19000:9000
+# 8123/9000이 아니라 18123/19000을 쓰는 이유, compress=false가 필요한 이유는
+# README.md "알려진 이슈" 절 참고.
+# 클러스터 안(파드)에서 실행할 때는 application-incluster.yml 프로파일을 사용한다.
+clickhouse:
+  # default 사용자(빈 비밀번호) 대신 push_click DB에만 SELECT/INSERT 권한을 가진
+  # 전용 사용자를 쓴다 (PRODUCTION.md 10절 "기본 사용자 빈 비밀번호 금지" 권고에
+  # 부합). 사전에 클러스터에 아래 명령으로 만들어 둬야 한다:
+  #   CREATE USER push_click_app ON CLUSTER 'cluster1'
+  #     IDENTIFIED WITH sha256_password BY '<password>';
+  #   GRANT ON CLUSTER 'cluster1' SELECT, INSERT ON push_click.* TO push_click_app;
+  # 실제 운영에서는 이 비밀번호를 Secrets Manager 등에서 주입해야 한다 — 여기서는
+  # 로컬 랩 편의상 평문으로 둔다.
+  jdbc-url: jdbc:ch://127.0.0.1:18123/push_click?async_insert=1&wait_for_async_insert=1&compress=false
+  username: push_click_app
+  password: "PushClickApp2026xyz"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
