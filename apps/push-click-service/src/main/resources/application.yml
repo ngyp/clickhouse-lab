@@ -2,9 +2,6 @@ spring:
   application:
     name: push-click-service
 
-server:
-  port: 8080
-
 # 로컬 개발 기본값: kind 랩 클러스터를 port-forward한 상태를 전제로 한다.
 #   kubectl --context kind-clickhouse-lab -n clickhouse port-forward --address 127.0.0.1 \
 #     svc/clickhouse-chi 18123:8123 19000:9000
@@ -18,14 +15,32 @@ clickhouse:
   #   CREATE USER push_click_app ON CLUSTER 'cluster1'
   #     IDENTIFIED WITH sha256_password BY '<password>';
   #   GRANT ON CLUSTER 'cluster1' SELECT, INSERT ON push_click.* TO push_click_app;
-  # 실제 운영에서는 이 비밀번호를 Secrets Manager 등에서 주입해야 한다 — 여기서는
-  # 로컬 랩 편의상 평문으로 둔다.
+  # 비밀번호는 소스에 절대 하드코딩하지 않는다 — CLICKHOUSE_PASSWORD 환경변수로
+  # 주입한다 (로컬: `export CLICKHOUSE_PASSWORD=...`, K8s: Secret + envFrom).
+  # 자세한 내용은 README.md "시큐어 코딩" 절 참고.
   jdbc-url: jdbc:ch://127.0.0.1:18123/push_click?async_insert=1&wait_for_async_insert=1&compress=false
   username: push_click_app
-  password: "PushClickApp2026xyz"
+  password: ${CLICKHOUSE_PASSWORD}
+
+server:
+  # 애플리케이션 API(server.port)와 운영/헬스체크(management.server.port)를
+  # 서로 다른 포트로 분리한다. 실제 배포 시 서비스/인그레스는 server.port만
+  # 외부에 노출하고, management.server.port는 클러스터 내부(kubelet
+  # liveness/readiness probe, 내부 모니터링)에서만 접근하게 해 상세 헬스체크
+  # 정보(레플리카/파트/뮤테이션 현황 등)가 외부에 노출되지 않도록 한다.
+  port: 8080
 
 management:
+  server:
+    port: 8081
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,clickhouse
+  endpoint:
+    health:
+      # show-details를 always로 둬도 안전한 이유: 이 값은 management.server.port
+      # (8081, 내부 전용)에만 적용되고, 실제 API가 노출되는 server.port(8080)에는
+      # 영향이 없다.
+      show-details: always
+      show-components: always
