@@ -20,12 +20,18 @@
     <properties>
         <java.version>21</java.version>
         <clickhouse-jdbc.version>0.7.1</clickhouse-jdbc.version>
+        <springdoc-openapi.version>2.6.0</springdoc-openapi.version>
     </properties>
 
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc-openapi.version}</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

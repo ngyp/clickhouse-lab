@@ -1,0 +1,339 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Push/Click Analytics Service",
+    "description": "Records app push-notification sends and user clicks, and exposes real-time click-through-rate (CTR) statistics per campaign. Backed by ClickHouse: writes go to append-only event tables (pushes, clicks), which are continuously and independently aggregated by two materialized views into hourly per-campaign counters; the stats endpoint joins those two pre-aggregated results at query time to compute CTR. Typical workflow for an agent or client: (1) call createOrUpdateCustomer once to register a customer, (2) call recordPushEvent when a push notification is sent to that customer for a campaign — save the returned sendId, (3) call recordClickEvent when the customer clicks that push, passing back the same sendId, customerId, and campaignId, (4) call getCampaignStats at any time to read up-to-date CTR for a campaign.",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.example.com",
+      "description": "Placeholder — replace with this service's real, reachable deployment URL (e.g. an API Gateway or ALB endpoint) before importing this spec into Swagger or registering it as an AWS Bedrock AgentCore Gateway target."
+    }
+  ],
+  "tags": [
+    {
+      "name": "Customers",
+      "description": "Manage customer records that push sends and clicks are attributed to."
+    },
+    {
+      "name": "Pushes",
+      "description": "Record push-notification send events."
+    },
+    {
+      "name": "Campaign Stats",
+      "description": "Read real-time click-through-rate statistics computed from recorded pushes and clicks."
+    },
+    {
+      "name": "Clicks",
+      "description": "Record push-notification click events."
+    }
+  ],
+  "paths": {
+    "/api/pushes": {
+      "post": {
+        "tags": [
+          "Pushes"
+        ],
+        "summary": "Record a push-notification send",
+        "description": "Records that a push notification was sent to a customer as part of a campaign. The returned sendId must be saved and passed back when recording the corresponding click via recordClickEvent, so that click-through statistics can be correctly attributed to this campaign.",
+        "operationId": "recordPushEvent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordPushRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The push-send event was accepted and will be written asynchronously.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordPushResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/customers": {
+      "post": {
+        "tags": [
+          "Customers"
+        ],
+        "summary": "Create or update a customer",
+        "description": "Creates a new customer record, or updates an existing one if a customer with the same customerId already exists (upsert). Call this before recording push or click events for a customer, or whenever the customer's device token or segment changes.",
+        "operationId": "createOrUpdateCustomer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCustomerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The customer record was accepted and will be written asynchronously."
+          }
+        }
+      }
+    },
+    "/api/clicks": {
+      "post": {
+        "tags": [
+          "Clicks"
+        ],
+        "summary": "Record a push-notification click",
+        "description": "Records that a customer clicked on a previously sent push notification. Requires the sendId returned by recordPushEvent for that push, along with the same customerId and campaignId, so the click can be correctly attributed to its campaign for CTR reporting.",
+        "operationId": "recordClickEvent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordClickRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The click event was accepted and will be written asynchronously.",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordClickResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/campaigns/{campaignId}/stats": {
+      "get": {
+        "tags": [
+          "Campaign Stats"
+        ],
+        "summary": "Get real-time campaign click-through-rate statistics",
+        "description": "Returns hourly-bucketed push-send count, click count, unique-clicker count, and click-through rate (CTR) for one campaign, covering the most recent N hours. Statistics reflect all recordPushEvent and recordClickEvent calls made for this campaignId; there may be a short delay (typically a few seconds) between an event being recorded and it appearing here, since the underlying aggregation runs asynchronously.",
+        "operationId": "getCampaignStats",
+        "parameters": [
+          {
+            "name": "campaignId",
+            "in": "path",
+            "description": "The campaign to get statistics for.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "example": 5001
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "How many hours of history to include, counting back from now. Minimum 1, maximum 168 (7 days).",
+            "required": false,
+            "schema": {
+              "maximum": 168,
+              "minimum": 1,
+              "type": "integer",
+              "format": "int32",
+              "default": 24
+            },
+            "example": 24
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignStatsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "RecordPushRequest": {
+        "required": [
+          "campaignId",
+          "customerId",
+          "templateId"
+        ],
+        "type": "object",
+        "properties": {
+          "sendId": {
+            "type": "string",
+            "description": "Optional client-supplied identifier for this send. If omitted, the server generates one and returns it in the response — callers must save it and pass it back later when recording the corresponding click.",
+            "format": "uuid"
+          },
+          "customerId": {
+            "type": "integer",
+            "description": "The customer the push was sent to.",
+            "format": "int64",
+            "example": 1001
+          },
+          "campaignId": {
+            "type": "integer",
+            "description": "The marketing campaign this push belongs to. Used to group sends and clicks for CTR reporting.",
+            "format": "int64",
+            "example": 5001
+          },
+          "templateId": {
+            "type": "string",
+            "description": "Identifier of the push message template/content that was sent.",
+            "example": "welcome"
+          }
+        },
+        "description": "Request to record that a push notification was sent to a customer as part of a campaign."
+      },
+      "RecordPushResponse": {
+        "type": "object",
+        "properties": {
+          "sendId": {
+            "type": "string",
+            "description": "Identifier of this push send. Save this value and pass it as sendId when calling recordClickEvent for the same push.",
+            "format": "uuid"
+          }
+        },
+        "description": "Confirmation that a push-send event was accepted, with the identifier needed to later record its click."
+      },
+      "CreateCustomerRequest": {
+        "required": [
+          "customerId",
+          "deviceToken"
+        ],
+        "type": "object",
+        "properties": {
+          "customerId": {
+            "type": "integer",
+            "description": "Unique identifier of the customer.",
+            "format": "int64",
+            "example": 1001
+          },
+          "deviceToken": {
+            "type": "string",
+            "description": "Push notification device token for this customer (e.g. an FCM/APNs token).",
+            "example": "device-abc123"
+          },
+          "segment": {
+            "type": "string",
+            "description": "Marketing segment label used to group customers for targeting or reporting. Defaults to \"default\" if omitted.",
+            "example": "vip"
+          }
+        },
+        "description": "Request to create a new customer or update an existing one (upsert by customerId)."
+      },
+      "RecordClickRequest": {
+        "required": [
+          "campaignId",
+          "customerId",
+          "sendId"
+        ],
+        "type": "object",
+        "properties": {
+          "sendId": {
+            "type": "string",
+            "description": "The sendId that was returned when the corresponding push notification was recorded via recordPushEvent.",
+            "format": "uuid"
+          },
+          "customerId": {
+            "type": "integer",
+            "description": "The customer who clicked. Should match the customerId used in the original recordPushEvent call.",
+            "format": "int64",
+            "example": 1001
+          },
+          "campaignId": {
+            "type": "integer",
+            "description": "The campaign this click belongs to. Should match the campaignId used in the original recordPushEvent call.",
+            "format": "int64",
+            "example": 5001
+          }
+        },
+        "description": "Request to record that a customer clicked on a previously sent push notification. campaignId must be repeated here (rather than looked up from sendId) so that click statistics can be aggregated independently from push-send statistics, without a real-time join between the two."
+      },
+      "RecordClickResponse": {
+        "type": "object",
+        "properties": {
+          "clickId": {
+            "type": "string",
+            "description": "Server-generated identifier for this click event.",
+            "format": "uuid"
+          }
+        },
+        "description": "Confirmation that a click event was accepted."
+      },
+      "CampaignStatsResponse": {
+        "type": "object",
+        "properties": {
+          "campaignId": {
+            "type": "integer",
+            "description": "The campaign these statistics are for.",
+            "format": "int64",
+            "example": 5001
+          },
+          "hourly": {
+            "type": "array",
+            "description": "One entry per hour that had any push or click activity, ordered oldest to newest. Empty if no activity occurred in the requested time window.",
+            "items": {
+              "$ref": "#/components/schemas/HourlyStat"
+            }
+          }
+        },
+        "description": "Real-time click-through-rate statistics for one campaign, bucketed by hour."
+      },
+      "HourlyStat": {
+        "type": "object",
+        "properties": {
+          "hour": {
+            "type": "string",
+            "description": "Start of the hour bucket (UTC).",
+            "format": "date-time"
+          },
+          "sentCount": {
+            "type": "integer",
+            "description": "Number of push notifications sent for this campaign during this hour.",
+            "format": "int64",
+            "example": 1
+          },
+          "clickCount": {
+            "type": "integer",
+            "description": "Number of clicks recorded for this campaign during this hour.",
+            "format": "int64",
+            "example": 1
+          },
+          "uniqueClickers": {
+            "type": "integer",
+            "description": "Number of distinct customers who clicked during this hour.",
+            "format": "int64",
+            "example": 1
+          },
+          "ctr": {
+            "type": "number",
+            "description": "Click-through rate for this hour, computed as clickCount / sentCount. Ranges from 0.0 to 1.0 (or higher if a customer clicked multiple times).",
+            "format": "double",
+            "example": 1.0
+          }
+        },
+        "description": "Push/click counters and computed CTR for a single hour bucket."
+      }
+    }
+  }
+}

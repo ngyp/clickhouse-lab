@@ -145,6 +145,9 @@ curl http://localhost:8081/actuator/health
 curl http://localhost:8081/actuator/clickhouse
 ```
 
+Swagger UI: http://localhost:8080/swagger-ui.html (아래 "OpenAPI / Swagger /
+AgentCore Gateway" 절 참고)
+
 ### 6. 테스트
 
 ```bash
@@ -311,6 +314,76 @@ GUIDE.md 12-1절의 `system.*` 치트시트를 그대로 애플리케이션 엔�
 이 구조 덕분에 `management.endpoint.health.show-details: always`(상세 정보
 전체 노출)로 설정해도 안전합니다 — 애초에 그 상세 정보가 나가는 포트 자체가
 외부에서 도달 불가능하기 때문입니다.
+
+## OpenAPI / Swagger / AgentCore Gateway
+
+이 서비스는 [springdoc-openapi](https://springdoc.org/)로 OpenAPI 스펙을 자동
+생성합니다. 매 컨트롤러 메서드에 붙인 `@Operation`(영어 `summary`/
+`description`)과 DTO의 `@Schema` 설명은 사람뿐 아니라 **AWS Bedrock
+AgentCore Gateway처럼 OpenAPI 스펙을 읽어 LLM 에이전트용 도구로 변환하는
+시스템**을 염두에 두고 영어로 작성했습니다 — Gateway는 각 operation을 MCP
+툴로 노출하고, `summary`/`description`이 곧 LLM이 "이 툴을 언제 써야 하는지"
+판단하는 근거가 되기 때문입니다.
+
+- Swagger UI: `http://localhost:8080/swagger-ui.html`
+- 원본 스펙(JSON): `http://localhost:8080/v3/api-docs`
+- 저장소에 커밋된 정적 스냅샷: [`openapi.json`](./openapi.json)
+
+### springdoc 버전에 관한 함정
+
+`pom.xml`은 springdoc-openapi **2.6.0**을 씁니다. 최신 버전(2.8.x, 2.9.x)을
+그대로 쓰면 부팅 시 다음 오류가 납니다:
+
+```
+NoClassDefFoundError: org/springframework/web/servlet/resource/LiteWebJarsResourceResolver
+```
+
+최신 springdoc 릴리스가 Spring Boot 3.3.4가 번들한 것보다 더 신버전 Spring
+Framework 클래스를 참조하기 때문입니다(springdoc 2.8.x/2.9.x는 대략 Boot
+3.4.x/3.5.x 대상). Boot 3.3.x를 쓰는 동안은 2.6.0~2.7.x 계열로 고정하세요.
+
+### 정적 `openapi.json` 재생성
+
+```bash
+# 앱을 기동한 상태에서
+curl -s http://localhost:8080/v3/api-docs \
+  | python3 -c "import json,sys; json.dump(json.load(sys.stdin), sys.stdout, indent=2, ensure_ascii=False)" \
+  > openapi.json
+```
+
+### AWS Bedrock AgentCore Gateway 등록 시 유의점
+
+이 스펙은 AgentCore Gateway의 OpenAPI 수집 제약(2026년 기준)에 맞춰
+설계했습니다:
+
+- **`operationId`가 곧 MCP 툴 이름**(`<target-name>___<operationId>` 형태로
+  노출)이 되므로, 4개 엔드포인트 전부에 명시적이고 고유한 영어
+  operationId(`createOrUpdateCustomer`, `recordPushEvent`,
+  `recordClickEvent`, `getCampaignStats`)를 부여했습니다. springdoc이
+  메서드 이름에서 자동 생성하게 두면 `record`처럼 겹치는 이름이 나올 수
+  있습니다.
+- **`securitySchemes`는 스펙에 넣지 않았습니다** — Gateway는 OpenAPI 문서의
+  보안 스킴을 읽지 않고, 백엔드 인증(API 키/OAuth2, 또는 API
+  Gateway·Lambda 뒤에 있을 때의 IAM/SigV4)은 **Gateway 타깃 설정에서
+  별도로** 구성합니다. 스펙에 임의로 보안 스킴을 넣으면 오히려 실제 인증
+  방식과 어긋나 혼란만 줍니다.
+- **복잡한 스키마 합성(`oneOf`/`anyOf`/`allOf`) 없음** — 모든 요청/응답이
+  평범한 Java record로 매핑되는 단순 평면 스키마입니다. 이전에는
+  `Map<String, UUID>`로 응답하던 두 엔드포인트를 `RecordPushResponse`/
+  `RecordClickResponse` 같은 고정 필드 DTO로 바꿔, 스키마가 "동적 키를 가진
+  객체"처럼 모호하게 보이지 않도록 했습니다.
+- **`servers` URL은 플레이스홀더**(`https://api.example.com`)입니다 —
+  Gateway는 동적 도메인 플레이스홀더(`https://{yourDomain}/`)가 있는
+  서버 URL을 지원하지 않으므로, 이 서비스를 실제로 배포한 뒤(API Gateway나
+  ALB 뒤에 두는 등) `OpenApiConfig`의 `servers(...)` 값을 실제 접근
+  가능한 고정 URL로 바꿔야 Gateway/Swagger에 정상 등록됩니다.
+- 스펙 자체는 OpenAPI 3.0.1(3.1이 아님)로 강제 출력합니다
+  (`application.yml`의 `springdoc.api-docs.version=openapi_3_0`) — Gateway는
+  3.0/3.1 둘 다 지원하지만, 다른 Swagger 도구 호환성까지 고려하면 3.0이
+  더 안전한 공통분모입니다.
+- Gateway 등록은 스펙을 S3에 올려 그 URI를 참조하거나, 타깃 생성 API 호출
+  시 JSON/YAML을 인라인으로 붙여넣는 두 방식 중 하나로 이뤄집니다 — 별도의
+  "파일 업로드" API는 없습니다.
 
 ## 다음 확장 아이디어
 

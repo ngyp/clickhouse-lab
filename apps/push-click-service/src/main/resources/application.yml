@@ -30,6 +30,18 @@ server:
   # 정보(레플리카/파트/뮤테이션 현황 등)가 외부에 노출되지 않도록 한다.
   port: 8080
 
+# Swagger UI: http://localhost:8080/swagger-ui.html
+# Raw OpenAPI JSON: http://localhost:8080/v3/api-docs
+# springdoc defaults to emitting OpenAPI 3.1 — forced down to 3.0 here for the
+# widest compatibility with Swagger tooling and AWS Bedrock AgentCore Gateway
+# (Gateway supports both 3.0 and 3.1, but 3.0 is the safer common denominator).
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+    version: openapi_3_0
+  swagger-ui:
+    path: /swagger-ui.html
+
 management:
   server:
     port: 8081
