@@ -183,6 +183,101 @@ Gateway 타깃으로 등록하면 됩니다(Gateway가 MCP 서버를 대신 호�
 않습니다). 인증은 Gateway 타깃 설정에서 별도로(OAuth/API 키/IAM) 구성합니다
 — 이 부분은 OpenAPI 타깃(경로 B)과 동일한 원칙입니다.
 
+## 실전 운영 업무 예시 — 프롬프트 → 툴콜 → 응답
+
+앞서 확인한 `altinity-mcp` 연결로, 실제 운영자가 자연어로 물어볼 법한 질문
+7가지를 그대로 수행했습니다. 각 항목은 **자연어 프롬프트 → 그걸 수행하기
+위해 호출한 `execute_query` 툴콜(SQL) → 실제 응답**의 3단 구조입니다. 전부
+`push_click_app`(최소 권한 앱 계정)로 수행했고, 있는 그대로의 결과(권한
+부족으로 실패한 사례 포함)를 기록했습니다.
+
+### 1. "지금 클러스터의 레플리카들이 전부 정상인가?"
+
+**툴콜**: `SELECT table, is_readonly, active_replicas, total_replicas FROM system.replicas ORDER BY table`
+
+**응답**: 5개 테이블 전부 `is_readonly=0`, `active_replicas=total_replicas=3`
+— 정상.
+
+### 2. "Keeper와의 연결 상태는?"
+
+**툴콜**: `SELECT * FROM system.zookeeper_connection`
+
+**응답**: `host=keeper-chk`, `session_uptime_elapsed_seconds=2156`,
+`is_expired=0` — 세션이 살아있고 약 36분째 유지 중.
+
+### 3. "INSERT가 지연될 위험이 있는 테이블이 있는가?"
+
+**툴콜**: `SELECT table, count() AS active_parts FROM system.parts WHERE active GROUP BY table ORDER BY active_parts DESC`
+
+**응답**: 전 테이블 `active_parts=1` — `parts_to_delay_insert`(1000) 대비
+전혀 위험 없음.
+
+### 4. "현재 진행 중인(미완료) mutation이 있는가?"
+
+**툴콜**: `SELECT database, table, mutation_id, command, is_done FROM system.mutations WHERE NOT is_done`
+
+**응답**: `{"columns": [], "types": [], "rows": null, "count": 0}` — 결과가
+0건일 때는 컬럼 스키마조차 빈 배열로 나온다는 점이 흥미롭습니다(에이전트
+쪽에서 "빈 결과"와 "쿼리 실패"를 구분해서 파싱해야 함).
+
+### 5. "최근 24시간 캠페인별 CTR 순위는?" (비즈니스 지표)
+
+**툴콜**: `SELECT campaign_id, sum(sent_count) AS sent, sum(click_count) AS clicks, sum(click_count)/sum(sent_count) AS ctr FROM push_click.campaign_realtime_stats WHERE hour >= now() - INTERVAL 24 HOUR GROUP BY campaign_id ORDER BY ctr DESC LIMIT 5`
+
+**응답**: 캠페인 9001 하나만 최근 24시간 내 활동 있음 (발송 240, 클릭 1,
+CTR 0.0042).
+
+### 6. "발송은 있는데 클릭이 0인 캠페인이 있는가?" (이상 탐지)
+
+**툴콜**: `SELECT campaign_id, sum(sent_count) AS sent, sum(click_count) AS clicks FROM push_click.campaign_realtime_stats GROUP BY campaign_id HAVING clicks = 0 AND sent > 0 ORDER BY sent DESC`
+
+**응답**: `campaign_id=999999` (발송 1, 클릭 0) 하나가 걸림 — 확인해보니
+이건 GUIDE.md 16절 TTL 실험 때 남긴 **테스트 데이터**였습니다. **정직한
+교훈**: 이런 이상탐지 쿼리는 랩/스테이징 환경의 남은 테스트 데이터를 진짜
+이상 신호로 오탐할 수 있습니다 — 프로덕션에서는 테스트/합성 데이터를
+구분할 태그나 별도 스키마가 필요합니다.
+
+### 7. "디스크 여유 공간은 충분한가?" — 처음엔 권한 부족으로 실패, 권한 추가 후 성공
+
+**첫 시도 툴콜**: `SELECT name, formatReadableSize(free_space) AS free, ... FROM system.disks`
+
+**첫 응답**: `DB::Exception: push_click_app: Not enough privileges. ... grant SELECT ON system.disks`
+— **최소 권한 원칙이 실제로 에이전트를 막은 사례**입니다. `push_click_app`
+계정엔 이전 실험들에서 필요했던 4개 시스템 테이블(`replicas`/`mutations`/
+`parts`/`zookeeper_connection`) 권한만 있었고, `system.disks`는 이번이
+처음 필요해진 것이었습니다.
+
+`PRODUCTION.md`/`TOOL-CALLING.md`에서 이미 정리한 "필요해지면 그때그때
+좁게 추가" 원칙 그대로, 딱 이 권한만 추가했습니다:
+
+```sql
+GRANT ON CLUSTER 'cluster1' SELECT ON system.disks TO push_click_app
+```
+
+**재시도 응답**: `free=35.26 GiB, total=97.87 GiB, free_pct=36` — 여유
+충분.
+
+**이 세션이 끝난 시점의 `push_click_app` 최종 권한**:
+
+```
+GRANT SELECT, INSERT ON push_click.* TO push_click_app
+GRANT SELECT ON system.disks TO push_click_app
+GRANT SELECT ON system.mutations TO push_click_app
+GRANT SELECT ON system.parts TO push_click_app
+GRANT SELECT ON system.replicas TO push_click_app
+GRANT SELECT ON system.zookeeper_connection TO push_click_app
+```
+
+### 정리
+
+7개 업무 중 6개는 즉시 성공, 1개는 권한 부족으로 실패했다가 정확히 필요한
+권한 하나만 추가해 해결했습니다. 이 실패 자체가 버그가 아니라 **의도된
+안전장치가 정상 작동한 것**입니다 — 에이전트(또는 그걸 조종하는 LLM)가
+계정에 부여된 것 이상은 절대 할 수 없다는 걸 실제로 확인한 셈입니다. 또한
+이상탐지 쿼리가 랩 환경의 잔여 테스트 데이터를 오탐한 사례는, 이런 종류의
+자동화된 운영 질의를 프로덕션에 실제로 쓰기 전에 테스트 데이터 오염
+가능성을 반드시 점검해야 한다는 실전 교훈입니다.
+
 ## 선택 기준 요약
 
 - **탐색적 분석·운영 디버깅·데이터 사이언티스트 워크플로** → 경로 A
