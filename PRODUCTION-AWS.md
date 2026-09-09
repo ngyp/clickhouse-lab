@@ -195,6 +195,51 @@ PRODUCTION.md 11절의 일반 K8s 체크리스트에 더해, EKS 한정으로 �
 - [ ] S3 Gateway VPC Endpoint 구성(백업/S3 디스크 트래픽용, NAT 비용 절감)
 - [ ] 리소스 requests/limits이 실제 인스턴스 사양 대비 과다/과소하지 않은지
       (AUDIT.md 4번 — 우리 랩은 이게 아예 없었음)
+- [ ] **HA/장애 내성 테스트는 로컬 `kubectl port-forward`가 아니라 실제
+      Service/ALB를 경유하는 클라이언트로.** `kubectl port-forward`는 파드
+      하나에 고정되고, 그 파드가 사라지면 다른 건강한 파드로 자동 전환하지
+      않고 터널 자체가 죽습니다(EKS의 실제 Service/ALB는 이런 문제가 없음).
+      로컬 개발 편의로 port-forward를 계속 쓰더라도, 복원력 결론을 낼 때는
+      반드시 EKS 안에서 실행되는 클라이언트로 재검증하세요 (PRODUCTION.md
+      11절, `apps/push-click-service/README.md` "실험 A 재현" 절 참고).
+
+## 12. LLM 에이전트 연동 — AWS Bedrock AgentCore Gateway
+
+ClickHouse 기반 API를 LLM 에이전트의 툴로 노출하고 싶다면(예: 이 저장소의
+`apps/push-click-service`), AgentCore Gateway가 OpenAPI 스펙을 읽어 각
+operation을 MCP 툴로 변환해줍니다. 실제로 구현·검증하며 확인한 제약사항
+(2026년 기준):
+
+- **OpenAPI 3.0/3.1 둘 다 지원**하지만, Swagger 2.0은 안 됩니다. springdoc
+  같은 생성기는 기본이 3.1일 수 있으니(2026년 기준) 다른 Swagger 도구와의
+  넓은 호환성까지 고려하면 3.0으로 강제 출력하는 게 안전합니다.
+- **`operationId`가 필수이며, 그대로 MCP 툴 이름이 됩니다**
+  (`<target-name>___<operationId>` 형태). 자동 생성에 맡기면 메서드 이름이
+  겹쳐(`record` 등) 모호한 이름이 나올 수 있으니, 모든 엔드포인트에 명시적이고
+  의미가 분명한 영어 operationId를 부여하세요. 설명(`summary`/`description`)도
+  LLM이 "언제 이 툴을 써야 하는지" 판단하는 근거이므로 영어로, 워크플로우
+  맥락까지 포함해 작성하는 게 좋습니다.
+- **`securitySchemes`를 스펙에 넣지 마세요.** Gateway는 OpenAPI 문서의 보안
+  스킴을 읽지 않습니다 — 백엔드 인증(API 키, OAuth2, 또는 API
+  Gateway/Lambda 뒤에 있을 때의 IAM/SigV4)은 Gateway 타깃 설정에서 별도로
+  구성합니다. ALB/EC2에 직접 노출된 백엔드는 IAM 인증 대상이 될 수 없다는
+  점도 유의하세요 — IAM 인증이 필요하면 API Gateway나 Lambda Function URL,
+  또는 다른 AgentCore Gateway 뒤에 둬야 합니다.
+- **복잡한 스키마 합성(`oneOf`/`anyOf`/`allOf`), 배열 파라미터의 복잡한
+  serialization, 바이너리 미디어 타입, callback/webhook, `links`는
+  지원하지 않습니다.** 평범한 flat DTO와 기본 path/query 파라미터로
+  설계하세요 — `Map<String, Object>` 같은 동적 키 응답도 스키마가 모호해
+  보이므로, 고정 필드를 가진 응답 타입으로 바꾸는 게 낫습니다.
+- **`servers`의 URL은 정적이어야 합니다** — `https://{yourDomain}/`처럼
+  동적 플레이스홀더가 있는 서버 URL은 지원하지 않습니다. 배포된 실제
+  API Gateway/ALB 엔드포인트로 고정하세요.
+- **등록 방식은 두 가지뿐입니다**: 스펙을 S3에 올려 그 URI를 참조하거나,
+  타깃 생성 API 호출 시 JSON/YAML을 인라인으로 붙여넣는 것 — 별도의 "파일
+  업로드" API는 없습니다.
+
+실제 구현 예시와 위 제약을 반영한 스펙은
+[`apps/push-click-service/openapi.json`](./apps/push-click-service/openapi.json)
+과 그 서비스의 README "OpenAPI / Swagger / AgentCore Gateway" 절을 참고하세요.
 
 ---
 
@@ -215,3 +260,7 @@ PRODUCTION.md 11절의 일반 K8s 체크리스트에 더해, EKS 한정으로 �
    서브넷 전용 배치
 9. Cluster Autoscaler/Karpenter가 stateful 파드를 함부로 축출하지 않도록
    PDB + 전용 노드그룹으로 보호
+10. 복원력 검증은 `kubectl port-forward`가 아니라 EKS 내부 클라이언트/실제
+    Service·ALB 경유로 (거짓 양성/음성 결과 방지)
+11. LLM 에이전트에 API를 노출할 계획이 있다면 AgentCore Gateway 제약(12절)을
+    설계 초기부터 반영 — 특히 `operationId`/스키마 단순성/정적 서버 URL
