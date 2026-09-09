@@ -68,3 +68,10 @@ PRODUCTION.md를 AWS(EKS + Altinity 오퍼레이터) 환경에 구체적으로 �
 이 랩 클러스터 위에서 동작하는 ClickHouse + Java(Spring Boot) 표준 스켈레톤
 (앱 푸시 발송/클릭 로그 → Materialized View 기반 실시간 CTR 통계)은
 **[apps/push-click-service](./apps/push-click-service)**를 참고하세요.
+
+## LLM 에이전트 툴 콜링
+
+ClickHouse를 LLM 에이전트가 직접(MCP) 또는 앱을 경유해(OpenAPI/AgentCore
+Gateway) 툴로 호출하는 두 가지 경로 비교와, `altinity-mcp`로 이 랩 클러스터에
+실제 연결해 검증한 결과는 **[TOOL-CALLING.md](./TOOL-CALLING.md)**를
+참고하세요.
