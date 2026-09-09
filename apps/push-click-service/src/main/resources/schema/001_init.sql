@@ -42,7 +42,12 @@ CREATE TABLE IF NOT EXISTS push_click.pushes_local ON CLUSTER 'cluster1'
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/push_click/pushes_local', '{replica}')
 PARTITION BY toYYYYMMDD(sent_at)
-ORDER BY (campaign_id, sent_at, send_id);
+ORDER BY (campaign_id, sent_at, send_id)
+-- 원본 이벤트는 90일 후 만료. 사전집계(push_stats_local)는 훨씬 작고 리포팅
+-- 가치가 오래 유지되므로 별도 TTL을 두지 않는다. TTL은 병합(또는
+-- MATERIALIZE TTL)이 그 파트를 건드릴 때만 실제로 적용된다 — GUIDE.md 16절
+-- 참고, "만료 즉시 삭제"가 아니다.
+TTL sent_at + INTERVAL 90 DAY;
 
 CREATE TABLE IF NOT EXISTS push_click.pushes ON CLUSTER 'cluster1' AS push_click.pushes_local
 ENGINE = Distributed('cluster1', 'push_click', pushes_local, cityHash64(customer_id));
@@ -63,7 +68,9 @@ CREATE TABLE IF NOT EXISTS push_click.clicks_local ON CLUSTER 'cluster1'
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/push_click/clicks_local', '{replica}')
 PARTITION BY toYYYYMMDD(clicked_at)
-ORDER BY (campaign_id, clicked_at, click_id);
+ORDER BY (campaign_id, clicked_at, click_id)
+-- pushes_local과 동일한 90일 보존 정책.
+TTL clicked_at + INTERVAL 90 DAY;
 
 CREATE TABLE IF NOT EXISTS push_click.clicks ON CLUSTER 'cluster1' AS push_click.clicks_local
 ENGINE = Distributed('cluster1', 'push_click', clicks_local, cityHash64(customer_id));

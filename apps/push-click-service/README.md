@@ -385,6 +385,105 @@ curl -s http://localhost:8080/v3/api-docs \
   시 JSON/YAML을 인라인으로 붙여넣는 두 방식 중 하나로 이뤄집니다 — 별도의
   "파일 업로드" API는 없습니다.
 
+## 데이터 라이프사이클 — `pushes`/`clicks`에 90일 TTL
+
+원본 이벤트 테이블(`pushes_local`, `clicks_local`)에 `TTL sent_at/clicked_at +
+INTERVAL 90 DAY`를 적용했습니다. 사전집계 테이블(`push_stats_local`/
+`click_stats_local`)은 campaign×hour 단위로 이미 훨씬 작고 리포팅 가치가
+오래가므로 TTL을 두지 않았습니다 — 원본 이벤트만 정리하고 집계 결과는 계속
+남기는, 실무에서 흔한 패턴입니다.
+
+```sql
+ALTER TABLE push_click.pushes_local ON CLUSTER 'cluster1' MODIFY TTL sent_at + INTERVAL 90 DAY;
+ALTER TABLE push_click.clicks_local ON CLUSTER 'cluster1' MODIFY TTL clicked_at + INTERVAL 90 DAY;
+```
+
+GUIDE.md 16절은 "TTL은 만료 즉시가 아니라 병합 시점에만 평가된다"는 걸,
+**배경 병합이 인위적으로 멈춰있던(`SYSTEM STOP MERGES`) 격리된 테스트
+테이블**로 보여줬습니다. 이번엔 반대 사례를 실측했습니다 — 실제 운영 중인
+테이블(배경 병합이 정상적으로 계속 도는)에 91일 전 타임스탬프로 백데이트된
+행을 넣었더니:
+
+```bash
+# 91일 전 타임스탬프로 삽입
+INSERT INTO push_click.pushes_local VALUES (generateUUIDv4(), 999999, 999999, 'ttl-expired-test', now() - INTERVAL 91 DAY, 'SENT');
+
+# 몇 초 뒤 조회 — 이미 사라짐
+SELECT count() FROM push_click.pushes_local WHERE template_id = 'ttl-expired-test';  -- => 0
+```
+
+`system.parts`를 보면 해당 파티션이 삽입 직후 곧바로 병합되며 TTL이 적용돼
+`rows=0`으로 비워진 걸 확인할 수 있었습니다. **병합이 활발한 테이블에서는
+TTL 정리가 수 초 내로 자동 반영되지만, 병합이 뜸한(또는 멈춘) 테이블에서는
+GUIDE.md 16절처럼 수십 분~그 이상 오래된 데이터가 남아있을 수 있다** — TTL을
+"보장된 삭제 시점"이 아니라 "정리 대상 표시"로 이해해야 한다는 게 두 실험을
+합쳐서 얻은 결론입니다.
+
+## 장애 내성 실측: 앱은 ClickHouse 장애에 어떻게 반응하는가
+
+지금까지 랩 실험들은 ClickHouse 자체의 복원력(레플리카/샤드/Keeper)을
+검증했습니다. 여기서는 **그 장애가 실제로 이 마이크로서비스를 거치는
+클라이언트에게 어떻게 보이는지**를 초 단위로 실측했습니다 — 앱을 로컬로
+띄우고 1초 간격으로 `GET /api/campaigns/{id}/stats`와
+`POST /api/pushes`를 계속 호출하면서 장애를 주입했습니다.
+
+### 실험 A: 레플리카 파드 강제 삭제 (경미한 장애)
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse delete pod chi-chi-cluster1-0-1-0
+```
+
+**결과**: 파드가 삭제되고 16초 만에 재기동되는 전체 구간(60초, 120회 호출)
+동안 **에러 0건**. `Distributed` 테이블이 죽은 레플리카를 자동으로 우회하는
+동작이 애플리케이션 레벨에서 완전히 투명했습니다 — 클라이언트는 뒤에서
+레플리카 하나가 죽었다 살아난 것을 전혀 알아챌 수 없습니다.
+
+### 실험 B: Keeper 쿼럼 상실 (심각한 장애) — 가장 놀라웠던 발견
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse scale statefulset chk-chk-keeper-0-1 chk-chk-keeper-0-2 --replicas=0
+```
+
+| 시각(경과) | `GET stats` | `POST pushes` | `/actuator/health` | 실제 저장된 행 수 |
+|---|---|---|---|---|
+| 쿼럼 상실 직후 | 200 | **202** | UP → **DOWN**(수 초 내) | 77 |
+| +10초 (여전히 쿼럼 없음) | 200 | **202** | DOWN | **77 (변화 없음!)** |
+| 쿼럼 복구 시도 (+81초) | 200 | 202 | DOWN | - |
+| +15초 후 | 200 | 202 | **UP**으로 복귀 | **89 (자동 반영됨)** |
+
+**가장 중요한 발견**: `POST /api/pushes`는 Keeper 쿼럼이 없는 내내 계속
+**`202 Accepted`를 정상 응답**했습니다 — 클라이언트 입장에선 아무 문제도
+없어 보입니다. 하지만 실제로는 `async_insert=1`이 로컬 큐에만 쌓아두고
+있었을 뿐, **10초 동안 응답은 77번 넘게 202를 반환했는데 실제 저장된 행은
+단 하나도 늘지 않았습니다.** `GET stats` 조회는 문제없이 계속 성공했는데,
+이는 읽기가 Keeper를 필요로 하지 않기 때문입니다(Keeper는 오직 쓰기
+합의(coordination)에만 관여).
+
+이 상태에서 **유일하게 정확한 신호는 HTTP 상태 코드가 아니라
+`/actuator/health`였습니다** — `clickHouseCluster` 컴포넌트가
+`keeperConnected: false`와 함께 `readonlyTables`에 **테이블 5개 전부**를
+정확히 나열하며 즉시 DOWN(503)으로 전환됐습니다. 만약 모니터링이 앱의 HTTP
+응답 코드만 보고 있었다면, 이 장애는 **완전히 눈에 띄지 않았을 것**입니다.
+
+쿼럼이 복구되자(9초 만에 3/3 정상), 앱의 헬스는 약 15초 뒤 자동으로 UP으로
+돌아왔고, 그동안 202로 "성공" 응답했지만 큐에 쌓여있던 쓰기들이 **사람의
+개입 없이 전부 자동으로 반영**됐습니다(77 → 89, 데이터 유실 없음, 지연만
+있었음).
+
+### 결론
+
+- **읽기 경로는 Keeper 장애에 영향받지 않는다** — 조회 API는 계속 정상
+  응답한다.
+- **쓰기 경로는 `async_insert`로 인해 장애를 "숨긴다"** — HTTP 202는
+  "받았다"는 뜻이지 "저장했다"는 뜻이 아니다. 이 갭이 벌어지는 동안은
+  클라이언트 관점에서 완전히 정상으로 보인다.
+- **`/actuator/health`(ClickHouseClusterHealthIndicator)가 유일하게 이
+  상황을 정확히 잡아낸다** — 프로덕션에서는 이 서비스의 알람을 반드시
+  HTTP 200/202 여부가 아니라 이 헬스 엔드포인트 기준으로 걸어야 한다.
+- 데이터는 결국 유실 없이 자동 반영됐지만, 그 사이 "저장됐다고 응답받은
+  데이터가 실제로는 아직 없는" 윈도우가 존재한다는 걸 이 서비스를 호출하는
+  쪽(특히 즉시 조회하는 로직)이 인지하고 있어야 한다.
+
 ## 다음 확장 아이디어
 
 - **배치 INSERT**: 지금은 요청마다 단건 INSERT + `async_insert=1`로 서버가
