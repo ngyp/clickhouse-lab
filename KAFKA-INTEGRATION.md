@@ -180,6 +180,106 @@ event_id=3  after-bad-message  (2026-09-11 02:17:19)  ← 이번에 처음 성�
 | `exceptions.text` / `exceptions.time` | 최근 에러 이력과 발생 시각 — poison pill 진단의 핵심 |
 | `assignments.topic` / `partition_id` | 이 컨슈머가 실제로 어느 토픽/파티션을 맡고 있는지 |
 
+## 부하 테스트: 컨슈머를 늘리면 실제로 빨라질까
+
+`kafka_num_consumers`를 늘려서 파티션 수만큼 병렬로 소비하게 하면 처리량이 오를
+것 같지만, GUIDE.md 15절에서 `max_parallel_replicas`가 오히려 역효과였던 것과
+같은 이유(이 랩은 6vCPU를 12개 CH 파드 + Keeper + Redpanda + 모니터링이 전부
+공유)로 여기서도 별 효과가 없을 거라 예상하고 실제로 측정해봤습니다.
+
+### 준비: 4파티션 토픽 + 4-컨슈머 Kafka 엔진 테이블
+
+```bash
+rpk topic create load_test_events -p 4 --brokers localhost:9092
+```
+
+```sql
+CREATE TABLE kafka_demo.load_test_queue
+(
+    event_id UInt64,
+    event_type String,
+    payload String
+)
+ENGINE = Kafka
+SETTINGS
+    kafka_broker_list = 'redpanda.clickhouse.svc.cluster.local:9092',
+    kafka_topic_list = 'load_test_events',
+    kafka_group_name = 'load_test_group_4c_v2',
+    kafka_format = 'JSONEachRow',
+    kafka_num_consumers = 4,
+    kafka_skip_broken_messages = 10;
+
+CREATE TABLE kafka_demo.load_test_events
+(
+    event_id UInt64,
+    event_type String,
+    payload String,
+    consumed_at DateTime64(3) DEFAULT now64(3)
+)
+ENGINE = MergeTree ORDER BY event_id;
+
+CREATE MATERIALIZED VIEW kafka_demo.load_test_mv TO kafka_demo.load_test_events AS
+SELECT event_id, event_type, payload FROM kafka_demo.load_test_queue;
+```
+
+메시지 5만 건짜리 JSON 파일을 만들어 `rpk topic produce`로 발행했습니다. 프로듀서
+자체는 병목이 전혀 아니었습니다 — 5만 건을 로컬 단일 노드 Redpanda에 발행하는 데
+약 0.2초(**초당 약 25만 건**)밖에 걸리지 않았습니다.
+
+### 겪은 함정 1: `DEFAULT now64(3)`는 행 단위가 아니라 블록 단위로 평가된다
+
+처음엔 `consumed_at`(`DEFAULT now64(3)`) 컬럼으로 행별 도착 시각을 재서 처리량을
+계산하려 했습니다. 그런데 첫 배치를 확인해보니 5만 건 전부의 `consumed_at`이
+**완전히 동일한 값**이었습니다(`min(consumed_at) == max(consumed_at)`). Kafka
+엔진 MV는 한 번에 하나의 블록(폴링 주기당 쌓인 메시지 묶음)을 통째로 INSERT하고,
+`now64()` 같은 비결정적 기본값 표현식은 **그 INSERT 블록 전체에 대해 한 번만
+평가**되기 때문입니다 — 행마다 다시 평가되지 않습니다. 그래서 이 컬럼은 "이
+배치가 대략 언제 들어왔는지"만 알려줄 뿐, 개별 행의 처리량/지연시간 측정에는
+쓸 수 없었습니다. 결국 애플리케이션 쪽 wall-clock(bash `date` 기반 폴링)으로
+측정 방식을 바꿨습니다.
+
+### 겪은 함정 2: 폴링 루프를 늦게 시작하면 타이밍을 놓친다
+
+Kafka 엔진 테이블은 MV가 생성되는 순간부터 바로 컨슈밍을 시작합니다. DDL 실행과
+폴링 루프 시작 사이에 몇 초라도 간격(예: 그 사이에 `rpk topic describe`처럼 다른
+명령을 실행)이 생기면, 처음 폴링했을 때 이미 100% 완료된 상태만 보게 되어 아무런
+타이밍 곡선도 얻을 수 없습니다. 실제로 첫 4-컨슈머 측정 시도가 이렇게 실패했습니다
+— DROP/CREATE를 한 명령으로, 폴링 시작을 별도의 다음 명령으로 나눠 실행했더니
+그 사이 이미 10만 건이 전부 소비되어버렸습니다. **DDL 실행과 0.15초 간격의 타이트한
+폴링 시작을 하나의 명령 안에** 묶어야 유효한 곡선을 얻을 수 있었습니다.
+
+### 측정 결과
+
+| 구성 | 소비한 메시지 | 소요 시간 | 처리량 |
+|---|---|---|---|
+| `kafka_num_consumers=1` | 50,000건 | 3.95초 | ≈12,658건/초 |
+| `kafka_num_consumers=4` (파티션 4개와 일치, 새 컨슈머 그룹으로 토픽 전체 재소비) | 100,000건 | 8.19초 | ≈12,210건/초 |
+
+4-컨슈머 측정은 메시지 수가 달라(10만 건, 새 컨슈머 그룹이라 토픽에 쌓인 전체를
+처음부터 재소비) 절대 시간으로는 직접 비교할 수 없지만, 건당 처리량으로 정규화하면
+**12,658건/초 vs 12,210건/초로 사실상 동일**(오차 범위 4% 이내)합니다.
+
+**결론: 이 환경에서는 `kafka_num_consumers`를 늘려도 처리량이 개선되지 않습니다.**
+GUIDE.md 15절의 `max_parallel_replicas` 실험과 정확히 같은 원인입니다 — 컨슈머
+스레드를 4개로 늘려도 그것들이 나눠 쓸 물리 CPU 코어 자체가 늘어나는 게 아니라,
+이미 다른 12개 CH 파드·Keeper·Redpanda·모니터링 스택과 공유 중인 6개 코어를
+서로 더 잘게 나눠 경쟁할 뿐이기 때문입니다. `kafka_num_consumers`는 **CPU 코어가
+실제로 여유 있고, 컨슈머당 처리량이 네트워크/디스크가 아니라 CPU 파싱 비용에
+막혀 있는 환경**에서만 의미가 있습니다 — 파티션 수를 늘리는 것도 마찬가지로,
+컨슈머를 늘릴 여유 코어가 없다면 파티션만 늘리는 건 효과가 없습니다.
+
+### 정리에 쓴 명령
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec chi-chi-cluster1-0-0-0 -- \
+  clickhouse-client --multiquery -q "
+    DROP TABLE kafka_demo.load_test_mv;
+    DROP TABLE kafka_demo.load_test_queue;
+    DROP TABLE kafka_demo.load_test_events;"
+kubectl --context kind-clickhouse-lab -n clickhouse exec deploy/redpanda -- \
+  rpk topic delete load_test_events --brokers localhost:9092
+```
+
 ## push-click-service에 적용한다면
 
 `apps/push-click-service`의 발송/클릭 이벤트를 지금처럼 HTTP INSERT 대신
