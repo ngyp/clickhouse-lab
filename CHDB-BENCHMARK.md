@@ -24,7 +24,8 @@ docker build -t chdb-bench:latest .
 
 설치된 버전(2026-09 시점): **chdb 4.3.0**(chdb-core 26.7.3), **pandas 3.0.5**,
 pyarrow 25.0.1 — 리서치에서 확인했던 "chDB 4.x 세대", "pandas 3.0 정식 출시"와
-정확히 일치했습니다.
+정확히 일치했습니다. (2026-09-11 PyPI 기준 재확인: `chdb`/`chdb-core` 모두
+4.3.0/26.7.3이 여전히 최신 버전 — 별도 venv에 새로 설치해 직접 검증.)
 
 `float64` 컬럼 3,200개(`col_0000` ~ `col_3199`), 25만 행을 pyarrow
 `ParquetWriter`로 5,000행씩 배치 기록(생성 자체가 메모리를 과하게 먹지 않도록):
