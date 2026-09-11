@@ -81,4 +81,12 @@ Gateway) 툴로 호출하는 두 가지 경로 비교와, `altinity-mcp`로 이 
 Redpanda(Kafka 호환)를 실제로 배포하고 ClickHouse `Kafka` 엔진 + MV로
 연동해 검증한 결과 — poison pill(깨진 메시지가 전체 소비를 멈추는 현상)와
 `kafka_skip_broken_messages`로 해결하는 법, 컨슈머 그룹 변경 시 재처리/중복
-이슈 등은 **[KAFKA-INTEGRATION.md](./KAFKA-INTEGRATION.md)**를 참고하세요.
+이슈, fan-out/MV 삭제/스키마 불일치/컨슈밍 중 파드 재시작 등 엣지 케이스는
+**[KAFKA-INTEGRATION.md](./KAFKA-INTEGRATION.md)**를 참고하세요.
+
+## chDB vs pandas 벤치마크
+
+pandas 대체재 리서치 후, 3,200개 컬럼·프로세스 메모리 한도를 넘는 데이터로
+chDB와 pandas를 같은 메모리 캡 아래 실측 비교한 결과(pandas는 8GB로도 OOM,
+chDB는 1.5GB로 성공)는 **[CHDB-BENCHMARK.md](./CHDB-BENCHMARK.md)**를
+참고하세요.
