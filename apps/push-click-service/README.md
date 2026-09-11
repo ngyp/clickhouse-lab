@@ -557,7 +557,9 @@ kubectl --context kind-clickhouse-lab -n clickhouse scale statefulset chk-chk-ke
   ClickHouse에는 조인용 스냅샷만 동기화하는 경우가 많습니다.
 - **Kafka 연동**: 발송/클릭 이벤트량이 커지면 앱이 ClickHouse에 직접 쓰는 대신
   Kafka로 발행하고, ClickHouse의 `Kafka` 테이블 엔진 + MV로 소비하는 구조가
-  안정성/버퍼링 면에서 유리합니다.
+  안정성/버퍼링 면에서 유리합니다 — 실제로 배포해 검증한 내용(poison pill
+  처리, 컨슈머 그룹 변경 시 재처리/중복 이슈 등)은
+  [`KAFKA-INTEGRATION.md`](../../KAFKA-INTEGRATION.md) 참고.
 - **`incluster` 프로파일로 클러스터 안에 배포**: `application-incluster.yml`을
   참고해 이 서비스 자체를 CHI와 같은 네임스페이스의 Deployment로 배포하면,
   이 문서의 "알려진 이슈 4번"(포트 충돌)은 애초에 발생하지 않습니다.

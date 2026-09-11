@@ -75,3 +75,10 @@ ClickHouse를 LLM 에이전트가 직접(MCP) 또는 앱을 경유해(OpenAPI/Ag
 Gateway) 툴로 호출하는 두 가지 경로 비교와, `altinity-mcp`로 이 랩 클러스터에
 실제 연결해 검증한 결과는 **[TOOL-CALLING.md](./TOOL-CALLING.md)**를
 참고하세요.
+
+## Kafka 테이블 엔진
+
+Redpanda(Kafka 호환)를 실제로 배포하고 ClickHouse `Kafka` 엔진 + MV로
+연동해 검증한 결과 — poison pill(깨진 메시지가 전체 소비를 멈추는 현상)와
+`kafka_skip_broken_messages`로 해결하는 법, 컨슈머 그룹 변경 시 재처리/중복
+이슈 등은 **[KAFKA-INTEGRATION.md](./KAFKA-INTEGRATION.md)**를 참고하세요.
