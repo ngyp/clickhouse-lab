@@ -78,98 +78,671 @@ kubectl --context kind-clickhouse-lab get nodes    # 4개 노드 모두 Ready �
 
 ---
 
-## 3. Altinity ClickHouse Operator 설치 (Helm)
+## 3. Altinity Operator 없이 직접 구성
+
+Altinity ClickHouse Operator를 사용하지 않고 Kubernetes 기본 리소스를 직접 정의하여 ClickHouse 환경을 구성합니다.
+
+Operator를 사용하지 않으므로 `ClickHouseKeeperInstallation(CHK)`, `ClickHouseInstallation(CHI)`과 같은 Custom Resource는 사용하지 않습니다.
+
+이후 단계에서는 `StatefulSet`, `Service`, `ConfigMap` 등의 Kubernetes 리소스를 직접 생성하여 다음과 같이 구성합니다.
+
+```
+3. Namespace 구성
+ │
+ └─ clickhouse-lab namespace 생성/확인
+
+4. ClickHouse Keeper 구성
+ │
+ ├─ 4-1. Keeper ConfigMap
+ ├─ 4-2. Keeper Headless Service
+ └─ 4-3. Keeper StatefulSet
+        ↓
+     Keeper 3대 Running
+     keeper-0 / keeper-1 / keeper-2
+
+5. ClickHouse Server 구성
+ │
+ ├─ 5-1. ClickHouse ConfigMap
+ ├─ 5-2. ClickHouse Headless Service
+ ├─ 5-3. ClickHouse StatefulSet
+ └─ 5-4. Cluster / Replication 확인
+        ↓
+     ClickHouse 3대 Running
+     clickhouse-0 / clickhouse-1 / clickhouse-2
+```
+
+먼저 ClickHouse 리소스를 배포할 namespace를 생성합니다.
 
 ```bash
-helm repo add altinity https://helm.altinity.com
-helm repo update altinity
-helm upgrade --install clickhouse-operator altinity/altinity-clickhouse-operator \
-  --kube-context kind-clickhouse-lab \
-  --namespace clickhouse --create-namespace
+kubectl --context kind-clickhouse-lab create namespace clickhouse
+kubectl --context kind-clickhouse-lab get namespace clickhouse #namespace가 생성되었는지 확인
+```
+---
+
+## 4. ClickHouse Keeper 구성 - Free Operator(StatefulSet, 3노드)
+
+Operator를 사용하지 않고 동일한 구성을 Kubernetes 기본 리소스로 직접 구성합니다.
+Keeper는 다음과 같이 3개의 Pod로 구성합니다.
+
+```text
+clickhouse-keeper-0
+clickhouse-keeper-1
+clickhouse-keeper-2
+```
+
+이를 위해 다음 Kubernetes 리소스를 직접 생성합니다.
+
+- `ConfigMap`: ClickHouse Keeper 설정
+- `Headless Service`: Keeper Pod 간 DNS 통신
+- `StatefulSet`: Keeper 3개 Pod 실행
+
+사용할 manifest는 다음과 같습니다.
+
+```text
+manifests/
+├── keeper-config.yaml
+├── keeper-service.yaml
+└── keeper-statefulset.yaml
+```
+
+### 4-1. Keeper Headless Service 생성
+
+먼저 Keeper Pod들이 고정된 DNS 이름으로 서로 통신할 수 있도록 Headless Service를 생성합니다.
+
+`manifests/keeper-service.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-keeper
+  namespace: clickhouse
+spec:
+  clusterIP: None
+  selector:
+    app: clickhouse-keeper
+  ports:
+    - name: client
+      port: 2181
+      targetPort: 2181
+    - name: raft
+      port: 9444
+      targetPort: 9444
+```
+
+Service를 생성합니다.
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/keeper-service.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get service clickhouse-keeper #생성 여부를 확인
+```
+`CLUSTER-IP`가 `None`으로 표시되면 Headless Service가 정상적으로 생성된 것입니다.
+
+### 4-2. Keeper ConfigMap 생성
+
+Keeper가 3개의 노드로 구성되어 Raft 기반으로 동작할 수 있도록 설정 파일을 생성합니다.
+
+각 Keeper는 고유한 `server_id`를 가져야 하며, 서로 통신할 수 있도록 `raft_configuration`을 설정합니다.
+
+`manifests/keeper-config.yaml`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-keeper-config
+  namespace: clickhouse
+data:
+  keeper_config.yaml: |
+    logger:
+      level: information
+      console: true
+
+    keeper_server:
+      tcp_port: 2181
+      server_id: ${KEEPER_SERVER_ID}
+
+      log_storage_path: /var/lib/clickhouse/coordination/log
+      snapshot_storage_path: /var/lib/clickhouse/coordination/snapshots
+
+      coordination_settings:
+        operation_timeout_ms: 10000
+        session_timeout_ms: 30000
+        raft_logs_level: information
+
+      raft_configuration:
+        server:
+          - id: 1
+            hostname: clickhouse-keeper-0.clickhouse-keeper
+            port: 9444
+
+          - id: 2
+            hostname: clickhouse-keeper-1.clickhouse-keeper
+            port: 9444
+
+          - id: 3
+            hostname: clickhouse-keeper-2.clickhouse-keeper
+            port: 9444
+```
+
+ConfigMap을 생성합니다.
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/keeper-config.yaml
+kubectl --context kind-clickhouse-lab  -n clickhouse get configmap clickhouse-keeper-config #생성 여부를 확인
+kubectl --context kind-clickhouse-lab -n clickhouse get configmap clickhouse-keeper-config -o yaml #설정내용 확인
+```
+
+### 4-3. Keeper StatefulSet 생성
+
+이제 ClickHouse Keeper를 실제로 실행할 `StatefulSet`을 생성합니다.
+
+```text
+clickhouse-keeper-0
+clickhouse-keeper-1
+clickhouse-keeper-2
+```
+
+각 Pod는 고유한 `server_id`를 가져야 하므로 Pod 이름의 ordinal 값을 이용해 `1`, `2`, `3`을 생성합니다.
+
+`manifests/keeper-statefulset.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse-keeper
+  namespace: clickhouse
+spec:
+  serviceName: clickhouse-keeper
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: clickhouse-keeper
+
+  template:
+    metadata:
+      labels:
+        app: clickhouse-keeper
+
+    spec:
+      containers:
+        - name: clickhouse-keeper
+          image: clickhouse/clickhouse-keeper:latest
+
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ORDINAL="${HOSTNAME##*-}"
+              SERVER_ID=$((ORDINAL + 1))
+
+              echo "Pod: ${HOSTNAME}"
+              echo "Keeper server_id: ${SERVER_ID}"
+
+              sed "s/\${KEEPER_SERVER_ID}/${SERVER_ID}/g" \
+                /etc/clickhouse-keeper-config/keeper_config.yaml \
+                > /etc/clickhouse-keeper/keeper_config.yaml
+
+              exec clickhouse-keeper \
+                --config-file=/etc/clickhouse-keeper/keeper_config.yaml
+
+          ports:
+            - name: client
+              containerPort: 2181
+
+            - name: raft
+              containerPort: 9444
+
+          volumeMounts:
+            - name: keeper-config
+              mountPath: /etc/clickhouse-keeper-config
+
+            - name: keeper-config-runtime
+              mountPath: /etc/clickhouse-keeper
+
+            - name: keeper-data
+              mountPath: /var/lib/clickhouse
+
+      volumes:
+        - name: keeper-config
+          configMap:
+            name: clickhouse-keeper-config
+
+        - name: keeper-config-runtime
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: keeper-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+```
+
+StatefulSet을 생성합니다.
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/keeper-statefulset.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get pods # pod 상태 확인
+```
+정상적으로 생성되면 다음과 같이 3개의 Keeper Pod가 표시됩니다.
+
+```text
+clickhouse-keeper-0
+clickhouse-keeper-1
+clickhouse-keeper-2
 ```
 
 ```bash
-kubectl --context kind-clickhouse-lab -n clickhouse get pods    # operator 2/2 Running 확인
-kubectl --context kind-clickhouse-lab get crd | grep altinity   # CHI/CHK CRD 확인
+kubectl --context kind-clickhouse-lab -n clickhouse get statefulset clickhouse-keeper #StatefulSet 상태도 확인
+kubectl --context kind-clickhouse-lab -n clickhouse logs clickhouse-keeper-0 #Keeper 로그를 확인
+kubectl --context kind-clickhouse-lab -n clickhouse get pvc #PVC 생성 여부를 확인
 ```
 
 ---
 
-## 4. ClickHouse Keeper 배포 (CHK, 3노드)
+## 5. ClickHouse 클러스터 직접 배포 (3샤드 × 3레플리카 + PVC)
 
-`manifests/chk.yaml`:
+Altinity Operator를 사용하지 않고 Kubernetes 기본 리소스인 `ConfigMap`, `Service`, `StatefulSet`을 이용하여 ClickHouse 클러스터를 직접 구성한다.
 
-```yaml
-apiVersion: "clickhouse-keeper.altinity.com/v1"
-kind: "ClickHouseKeeperInstallation"
-metadata:
-  name: chk
-  namespace: clickhouse
-spec:
-  configuration:
-    clusters:
-      - name: "keeper"
-        layout:
-          replicasCount: 3
+구성은 다음과 같다.
+
+```text
+ClickHouse Keeper
+├── clickhouse-keeper-0
+├── clickhouse-keeper-1
+└── clickhouse-keeper-2
+
+ClickHouse Cluster (cluster1)
+├── Shard 1
+│   ├── clickhouse-0 (replica 1)
+│   ├── clickhouse-1 (replica 2)
+│   └── clickhouse-2 (replica 3)
+├── Shard 2
+│   ├── clickhouse-3 (replica 1)
+│   ├── clickhouse-4 (replica 2)
+│   └── clickhouse-5 (replica 3)
+└── Shard 3
+    ├── clickhouse-6 (replica 1)
+    ├── clickhouse-7 (replica 2)
+    └── clickhouse-8 (replica 3)
 ```
 
-```bash
-kubectl --context kind-clickhouse-lab apply -f manifests/chk.yaml
+각 ClickHouse Pod는 PVC를 하나씩 사용한다.
 
-# 완료까지 폴링
-kubectl --context kind-clickhouse-lab -n clickhouse get chk chk -w
-```
+### 5-1. ClickHouse 공통 설정 생성
 
-`Completed` 상태가 되면 `keeper-chk`라는 클라이언트 서비스(2181/TCP)가 생성됩니다.
-**서비스 이름 규칙: `keeper-<CHK 리소스 이름>`.**
-
----
-
-## 5. ClickHouse 클러스터 배포 (CHI, 3샤드×3레플리카 + PVC)
-
-`manifests/chi.yaml`:
+`manifests/clickhouse-config.yaml`:
 
 ```yaml
-apiVersion: "clickhouse.altinity.com/v1"
-kind: "ClickHouseInstallation"
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: chi
+  name: clickhouse-config
   namespace: clickhouse
-spec:
-  defaults:
-    templates:
-      dataVolumeClaimTemplate: default-volume-claim
-  configuration:
+data:
+  cluster.yaml: |
+    remote_servers:
+      cluster1:
+        shard:
+          - internal_replication: true
+            replica:
+              - host: clickhouse-0.clickhouse-headless
+                port: 9000
+              - host: clickhouse-1.clickhouse-headless
+                port: 9000
+              - host: clickhouse-2.clickhouse-headless
+                port: 9000
+
+          - internal_replication: true
+            replica:
+              - host: clickhouse-3.clickhouse-headless
+                port: 9000
+              - host: clickhouse-4.clickhouse-headless
+                port: 9000
+              - host: clickhouse-5.clickhouse-headless
+                port: 9000
+
+          - internal_replication: true
+            replica:
+              - host: clickhouse-6.clickhouse-headless
+                port: 9000
+              - host: clickhouse-7.clickhouse-headless
+                port: 9000
+              - host: clickhouse-8.clickhouse-headless
+                port: 9000
+
     zookeeper:
-      nodes:
-        - host: keeper-chk       # 4단계에서 만든 Keeper 서비스
+      node:
+        - host: clickhouse-keeper-0.clickhouse-keeper
           port: 2181
-    clusters:
-      - name: "cluster1"
-        layout:
-          shardsCount: 3
-          replicasCount: 3
-  templates:
-    volumeClaimTemplates:
-      - name: default-volume-claim
-        spec:
-          accessModes:
-            - ReadWriteOnce
-          resources:
-            requests:
-              storage: 2Gi
+        - host: clickhouse-keeper-1.clickhouse-keeper
+          port: 2181
+        - host: clickhouse-keeper-2.clickhouse-keeper
+          port: 2181
+
+  server.yaml: |
+    listen_host: "0.0.0.0"
+    interserver_http_port: 9009
 ```
 
-> **PVC는 필수입니다.** `dataVolumeClaimTemplate` 없이 배포하면 각 파드가
-> `emptyDir`(임시 디스크)를 쓰게 되어, 파드가 재시작될 때마다 로컬 데이터와
-> 테이블 스키마가 통째로 사라집니다 (7-2절 참고).
+적용:
 
 ```bash
-kubectl --context kind-clickhouse-lab apply -f manifests/chi.yaml
-kubectl --context kind-clickhouse-lab -n clickhouse get chi chi -w   # Completed 대기 (9 hosts)
-kubectl --context kind-clickhouse-lab -n clickhouse get pods -o wide
+kubectl --context kind-clickhouse-lab apply -f manifests/clickhouse-config.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get configmap clickhouse-config
+```
+
+### 5-2. ClickHouse Headless Service 생성
+
+StatefulSet의 각 Pod가 고정된 DNS 이름으로 서로 통신할 수 있도록 Headless Service를 생성한다.
+
+`manifests/clickhouse-service.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-headless
+  namespace: clickhouse
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+
+  selector:
+    app: clickhouse
+
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+
+    - name: native
+      port: 9000
+      targetPort: 9000
+
+    - name: interserver
+      port: 9009
+      targetPort: 9009
+```
+
+적용:
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/clickhouse-service.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get svc clickhouse-headless
+```
+`CLUSTER-IP`가 `None`이면 정상이다.
+
+StatefulSet에 의해 생성되는 Pod는 다음과 같은 DNS 이름을 갖게 된다.
+
+```text
+clickhouse-0.clickhouse-headless
+clickhouse-1.clickhouse-headless
+...
+clickhouse-8.clickhouse-headless
+```
+
+### 5-3. ClickHouse StatefulSet 생성
+
+하나의 StatefulSet으로 ClickHouse Pod 9개를 생성한다.
+
+각 Pod의 ordinal을 기준으로 shard와 replica를 다음과 같이 구성한다.
+
+```text
+ordinal 0 → shard 01 / replica 01
+ordinal 1 → shard 01 / replica 02
+ordinal 2 → shard 01 / replica 03
+
+ordinal 3 → shard 02 / replica 01
+ordinal 4 → shard 02 / replica 02
+ordinal 5 → shard 02 / replica 03
+
+ordinal 6 → shard 03 / replica 01
+ordinal 7 → shard 03 / replica 02
+ordinal 8 → shard 03 / replica 03
+```
+
+`ReplicatedMergeTree`에서 사용할 `{shard}`, `{replica}` 매크로는 `initContainer`에서 각 Pod별로 생성한다.
+
+`manifests/clickhouse-statefulset.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: clickhouse
+
+spec:
+  serviceName: clickhouse-headless
+  replicas: 9
+
+  selector:
+    matchLabels:
+      app: clickhouse
+
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+
+    spec:
+      initContainers:
+        - name: generate-macros
+          image: busybox:1.36
+
+          command:
+            - sh
+            - -c
+            - |
+              ORDINAL=${HOSTNAME##*-}
+
+              SHARD=$((ORDINAL / 3 + 1))
+              REPLICA=$((ORDINAL % 3 + 1))
+
+              cat <<EOF > /generated-config/macros.yaml
+              macros:
+                shard: "$(printf '%02d' ${SHARD})"
+                replica: "$(printf '%02d' ${REPLICA})"
+
+              interserver_http_host: "${HOSTNAME}.clickhouse-headless.clickhouse.svc.cluster.local"
+              EOF
+
+              echo "Generated macros:"
+              cat /generated-config/macros.yaml
+
+          volumeMounts:
+            - name: generated-config
+              mountPath: /generated-config
+
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:latest
+
+          ports:
+            - name: http
+              containerPort: 8123
+
+            - name: native
+              containerPort: 9000
+
+            - name: interserver
+              containerPort: 9009
+
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+
+            - name: clickhouse-config
+              mountPath: /etc/clickhouse-server/config.d/cluster.yaml
+              subPath: cluster.yaml
+
+            - name: clickhouse-config
+              mountPath: /etc/clickhouse-server/config.d/server.yaml
+              subPath: server.yaml
+
+            - name: generated-config
+              mountPath: /etc/clickhouse-server/config.d/macros.yaml
+              subPath: macros.yaml
+
+      volumes:
+        - name: clickhouse-config
+          configMap:
+            name: clickhouse-config
+
+        - name: generated-config
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: clickhouse-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
+```
+
+적용:
+
+```bash
+kubectl --context kind-clickhouse-lab apply -f manifests/clickhouse-statefulset.yaml
+kubectl --context kind-clickhouse-lab -n clickhouse get pods -w
+```
+
+정상적으로 구성되면 9개의 ClickHouse Pod가 생성된다.
+
+```text
+clickhouse-0   1/1   Running
+clickhouse-1   1/1   Running
+clickhouse-2   1/1   Running
+clickhouse-3   1/1   Running
+clickhouse-4   1/1   Running
+clickhouse-5   1/1   Running
+clickhouse-6   1/1   Running
+clickhouse-7   1/1   Running
+clickhouse-8   1/1   Running
+```
+
+PVC 확인:
+
+```bash
 kubectl --context kind-clickhouse-lab -n clickhouse get pvc
 ```
+총 9개의 `clickhouse-data-*` PVC가 생성되었는지 확인한다.
+
+### 5-4. shard / replica 설정 확인
+
+각 Pod에 생성된 ClickHouse macro를 확인한다.
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec clickhouse-0 -- \
+  cat /etc/clickhouse-server/config.d/macros.yaml
+```
+
+예상 결과:
+
+```yaml
+macros:
+  shard: "01"
+  replica: "01"
+
+interserver_http_host: "clickhouse-0.clickhouse-headless.clickhouse.svc.cluster.local"
+```
+
+다른 Pod도 확인한다.
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec clickhouse-4 -- \
+  cat /etc/clickhouse-server/config.d/macros.yaml
+```
+
+예상 결과:
+
+```yaml
+macros:
+  shard: "02"
+  replica: "02"
+
+interserver_http_host: "clickhouse-4.clickhouse-headless.clickhouse.svc.cluster.local"
+```
+
+마지막 Pod도 확인한다.
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec clickhouse-8 -- \
+  cat /etc/clickhouse-server/config.d/macros.yaml
+```
+
+예상 결과:
+
+```yaml
+macros:
+  shard: "03"
+  replica: "03"
+
+interserver_http_host: "clickhouse-8.clickhouse-headless.clickhouse.svc.cluster.local"
+```
+
+---
+
+### 5-5. ClickHouse 클러스터 상태 확인
+
+첫 번째 ClickHouse Pod에서 `system.clusters`를 조회한다.
+
+```bash
+kubectl --context kind-clickhouse-lab \
+  -n clickhouse exec clickhouse-0 -- \
+  clickhouse-client -q "
+    SELECT
+        cluster,
+        shard_num,
+        replica_num,
+        host_name
+    FROM system.clusters
+    WHERE cluster = 'cluster1'
+    ORDER BY shard_num, replica_num
+    FORMAT PrettyCompact
+  "
+```
+
+총 9개의 host가 조회되어야 한다.
+
+```text
+cluster1    1    1    clickhouse-0.clickhouse-headless
+cluster1    1    2    clickhouse-1.clickhouse-headless
+cluster1    1    3    clickhouse-2.clickhouse-headless
+
+cluster1    2    1    clickhouse-3.clickhouse-headless
+cluster1    2    2    clickhouse-4.clickhouse-headless
+cluster1    2    3    clickhouse-5.clickhouse-headless
+
+cluster1    3    1    clickhouse-6.clickhouse-headless
+cluster1    3    2    clickhouse-7.clickhouse-headless
+cluster1    3    3    clickhouse-8.clickhouse-headless
+```
+
+Keeper 연결 여부도 확인한다.
+
+```bash
+kubectl --context kind-clickhouse-lab -n clickhouse exec clickhouse-0 -- \
+  clickhouse-client -q "
+    SELECT *
+    FROM system.zookeeper
+    WHERE path = '/'
+  "
+```
+
+정상적으로 결과가 반환되면 ClickHouse Server에서 Keeper에 연결할 수 있는 상태이다.
+
+이제 Operator를 사용하는 `operator 사용 할 때`와 동일하게 `3 shards × 3 replicas` 구조의 ClickHouse 클러스터가 준비되었다.
 
 ---
 
@@ -201,6 +774,10 @@ CREATE TABLE events ON CLUSTER 'cluster1' AS events_local
 ENGINE = Distributed('cluster1', currentDatabase(), events_local, rand())
 "
 ```
+
+
+
+
 
 ### 6-3. 데이터 삽입 및 분산/복제 확인
 

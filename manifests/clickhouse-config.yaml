@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-config
+  namespace: clickhouse
+data:
+  cluster.yaml: |
+    remote_servers:
+      cluster1:
+        shard:
+          - internal_replication: true
+            replica:
+              - host: clickhouse-0.clickhouse-headless
+                port: 9000
+              - host: clickhouse-1.clickhouse-headless
+                port: 9000
+              - host: clickhouse-2.clickhouse-headless
+                port: 9000
+
+          - internal_replication: true
+            replica:
+              - host: clickhouse-3.clickhouse-headless
+                port: 9000
+              - host: clickhouse-4.clickhouse-headless
+                port: 9000
+              - host: clickhouse-5.clickhouse-headless
+                port: 9000
+
+          - internal_replication: true
+            replica:
+              - host: clickhouse-6.clickhouse-headless
+                port: 9000
+              - host: clickhouse-7.clickhouse-headless
+                port: 9000
+              - host: clickhouse-8.clickhouse-headless
+                port: 9000
+
+    zookeeper:
+      node:
+        - host: clickhouse-keeper-0.clickhouse-keeper
+          port: 2181
+        - host: clickhouse-keeper-1.clickhouse-keeper
+          port: 2181
+        - host: clickhouse-keeper-2.clickhouse-keeper
+          port: 2181
+
+  server.yaml: |
+    listen_host: "0.0.0.0"
+    interserver_http_port: 9009

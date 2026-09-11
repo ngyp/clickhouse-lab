@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: clickhouse
+
+spec:
+  serviceName: clickhouse-headless
+  replicas: 9
+
+  selector:
+    matchLabels:
+      app: clickhouse
+
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+
+    spec:
+      initContainers:
+        - name: generate-macros
+          image: busybox:1.36
+
+          command:
+            - sh
+            - -c
+            - |
+              ORDINAL=${HOSTNAME##*-}
+
+              SHARD=$((ORDINAL / 3 + 1))
+              REPLICA=$((ORDINAL % 3 + 1))
+
+              cat <<EOF > /generated-config/macros.yaml
+              macros:
+                shard: "$(printf '%02d' ${SHARD})"
+                replica: "$(printf '%02d' ${REPLICA})"
+
+              interserver_http_host: "${HOSTNAME}.clickhouse-headless.clickhouse.svc.cluster.local"
+              EOF
+
+              echo "Generated macros:"
+              cat /generated-config/macros.yaml
+
+          volumeMounts:
+            - name: generated-config
+              mountPath: /generated-config
+
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:latest
+
+          ports:
+            - name: http
+              containerPort: 8123
+
+            - name: native
+              containerPort: 9000
+
+            - name: interserver
+              containerPort: 9009
+
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+
+            - name: clickhouse-config
+              mountPath: /etc/clickhouse-server/config.d/cluster.yaml
+              subPath: cluster.yaml
+
+            - name: clickhouse-config
+              mountPath: /etc/clickhouse-server/config.d/server.yaml
+              subPath: server.yaml
+
+            - name: generated-config
+              mountPath: /etc/clickhouse-server/config.d/macros.yaml
+              subPath: macros.yaml
+
+      volumes:
+        - name: clickhouse-config
+          configMap:
+            name: clickhouse-config
+
+        - name: generated-config
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: clickhouse-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
