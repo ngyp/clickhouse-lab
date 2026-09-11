@@ -88,5 +88,7 @@ Redpanda(Kafka 호환)를 실제로 배포하고 ClickHouse `Kafka` 엔진 + MV�
 
 pandas 대체재 리서치 후, 3,200개 컬럼·프로세스 메모리 한도를 넘는 데이터로
 chDB와 pandas를 같은 메모리 캡 아래 실측 비교한 결과(pandas는 8GB로도 OOM,
-chDB는 1.5GB로 성공)는 **[CHDB-BENCHMARK.md](./CHDB-BENCHMARK.md)**를
-참고하세요.
+chDB는 1.5GB로 성공)는 **[CHDB-BENCHMARK.md](./CHDB-BENCHMARK.md)**를,
+평범한 크기의 데이터로 chDB/pandas/Polars/DuckDB 네 엔진의 속도를 비교한
+결과(top-N 정렬에서 API 선택이 성패를 가른 사례 포함)는
+**[CHDB-SPEED-BENCHMARK.md](./CHDB-SPEED-BENCHMARK.md)**를 참고하세요.
