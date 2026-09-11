@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse-keeper
+  namespace: clickhouse
+spec:
+  serviceName: clickhouse-keeper
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: clickhouse-keeper
+
+  template:
+    metadata:
+      labels:
+        app: clickhouse-keeper
+
+    spec:
+      containers:
+        - name: clickhouse-keeper
+          image: clickhouse/clickhouse-keeper:latest
+
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ORDINAL="${HOSTNAME##*-}"
+              SERVER_ID=$((ORDINAL + 1))
+
+              echo "Starting Keeper with server_id=${SERVER_ID}"
+
+              sed "s/\${KEEPER_SERVER_ID}/${SERVER_ID}/g" \
+                  /etc/clickhouse-keeper-config/keeper_config.yaml \
+                  > /etc/clickhouse-keeper/keeper_config.yaml
+              
+              cat /etc/clickhouse-keeper/keeper_config.yaml
+
+              exec clickhouse-keeper \
+                --config-file=/etc/clickhouse-keeper/keeper_config.yaml
+
+          ports:
+            - name: client
+              containerPort: 2181
+
+            - name: raft
+              containerPort: 9444
+
+          volumeMounts:
+            - name: keeper-config
+              mountPath: /etc/clickhouse-keeper-config
+
+            - name: keeper-config-runtime
+              mountPath: /etc/clickhouse-keeper
+
+            - name: keeper-data
+              mountPath: /var/lib/clickhouse
+
+      volumes:
+        - name: keeper-config
+          configMap:
+            name: clickhouse-keeper-config
+
+        - name: keeper-config-runtime
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: keeper-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+

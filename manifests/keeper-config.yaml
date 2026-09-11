@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-keeper-config
+  namespace: clickhouse
+data:
+  keeper_config.yaml: |
+    logger:
+      level: information
+      console: true
+
+    keeper_server:
+      tcp_port: 2181
+      server_id: ${KEEPER_SERVER_ID}
+
+      log_storage_path: /var/lib/clickhouse/coordination/log
+      snapshot_storage_path: /var/lib/clickhouse/coordination/snapshots
+
+      coordination_settings:
+        operation_timeout_ms: 10000
+        session_timeout_ms: 30000
+        raft_logs_level: information
+
+      raft_configuration:
+        server:
+          - id: 1
+            hostname: clickhouse-keeper-0.clickhouse-keeper
+            port: 9444
+
+          - id: 2
+            hostname: clickhouse-keeper-1.clickhouse-keeper
+            port: 9444
+
+          - id: 3
+            hostname: clickhouse-keeper-2.clickhouse-keeper
+            port: 9444
