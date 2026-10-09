@@ -1,0 +1,174 @@
+# 공통 실험 기준
+
+[클러스터 케이스](../README.md) · [기대 기준](../../expected/README.md)
+
+## 동일하게 유지할 조건
+
+- 같은 합성 입력, 이벤트 종류, 조회 조건과 자원을 사용합니다.
+- 첫 비교는 standalone과 동일한 최소 received_at 기준입니다. 동률은 message_id로 선택합니다.
+- 시간별 귀속은 비교 쿼리에서 선택된 이벤트의 occurred_at으로 통일합니다.
+- 최소 occurred_at 선택으로의 변경은 별도 실험으로 구분합니다.
+- 같은 journey_id의 product_id는 고정입니다. 고객 그룹은 대표 이벤트에서 가져옵니다.
+- 그룹 배열 내부 중복은 제거합니다. 여러 그룹에 속한 이벤트는 그룹별로 집계되므로 그룹 합계를 전체 누적으로 사용하지 않습니다.
+- HLL은 전체 누적의 근사값이며, 최초 시각·그룹 귀속을 결정하는 연산이 아닙니다.
+- 정확 count는 단일 노드와 완전히 같아야 합니다. HLL은 고정 샘플 결과를 확인하고, 대용량 데이터에서는 정확 count 대비 상대 오차 3% 이하를 초기 기준으로 사용합니다.
+
+## 데이터와 배포 분리
+
+조회 비교용 원본은 `shop_benchmark.shopping_events`에 한 번만 적재하고 이후 변경하지 않습니다. A1~A7은 공통 원본을 직접 조회하거나 각 케이스의 dedup·summary 테이블로 backfill합니다. 이미 들어간 데이터를 MV가 자동 처리하지 않으므로 초기 파생 데이터는 명시적인 `INSERT SELECT`로 생성합니다.
+
+각 케이스는 `shop_a1`부터 `shop_a6`, A7-1은 `shop_a7_1` 별도 DB를 사용합니다. 모든 케이스의 MV를 공통 원본에 동시에 연결하지 않습니다. 실시간 MV 반영과 적재 처리량은 케이스별 쓰기 부하가 달라지므로 공통 snapshot 조회와 분리해 각각 독립 적재로 측정합니다.
+
+## 공통 원본 파일
+
+| 파일 | 역할 |
+|---|---|
+| [schema.sql](./schema.sql) | MV가 없는 Replicated 원본과 Distributed 테이블 생성 |
+| [generate-data-chunk.sql](./generate-data-chunk.sql) | 분산 상품군·대규모 집중 상품을 100만 journey chunk로 생성 |
+| [run-generate-data.sh](./run-generate-data.sh) | 총 20개 chunk를 순차 적재 |
+| [validate-data.sql](./validate-data.sql) | 전체·이벤트별·상품별 행 수와 replica 상태 검증 |
+
+공통 원본의 기준 분포는 다음과 같습니다.
+
+| 구분 | 상품 수 | 상품당 journey | 전체 journey | 원본 event |
+|---|---:|---:|---:|---:|
+| 분산 상품군 | 100 | 100,000 | 10,000,000 | 11,100,000 |
+| 대규모 집중 상품 | 1 | 10,000,000 | 10,000,000 | 11,100,000 |
+| 전체 데이터셋 | 101 | 혼합 | 20,000,000 | 22,200,000 |
+
+### 데이터 분포별 의미
+
+`분산 상품군`, `대규모 집중 상품`, `전체 데이터셋`은 서로 다른 테이블이 아니라 `shop_benchmark.shopping_events` 안에 함께 들어 있는 조회 범위입니다.
+
+| 조회 범위 | product_id | 대상 원본 | 확인 목적 |
+|---|---|---:|---|
+| 분산 상품 1개 | `1000000`~`1000099` 중 하나 | 111,000행 | 평상시 상품 단위 API 조회 |
+| 분산 상품군 | `1000000`~`1000099` 전체 | 11,100,000행 | 여러 상품을 묶은 조회·배치 |
+| 대규모 집중 상품 | `2000000` | 11,100,000행 | 한 상품에 데이터가 몰리는 최악 조건 |
+| 전체 데이터셋 | 위 101개 상품 전체 | 22,200,000행 | 전체 검증·관리·배치 작업 |
+
+분산 상품 하나에는 journey 100,000개가 있습니다. 이벤트 발생 비율과 늦게 수집된 중복 `CLICK`을 적용하면 원본은 111,000행, 최초 이벤트 기준 dedup 결과는 110,500행입니다.
+
+```text
+NOTIFY          100,000
+CLICK             5,000
+VIEW              4,000
+CART              1,000
+PURCHASE            500
+중복 CLICK           500
+------------------------
+원본 event       111,000
+dedup event      110,500
+```
+
+대규모 집중 상품은 같은 비율을 journey 10,000,000개에 적용합니다. 따라서 상품 조건으로 범위를 좁혀도 원본 11,100,000행과 dedup 11,050,000행을 처리합니다. 이 케이스는 일반적인 평균 상품이 아니라 데이터 쏠림에 대한 한계 시험입니다.
+
+성능 비교의 핵심은 평상시 조건인 `분산 상품 1개`와 최악 조건인 `대규모 집중 상품`입니다. `전체 데이터셋` 조회는 일반 API 요청보다 전체 검증이나 배치 작업에 가까운 조건으로 해석합니다.
+
+저장소 루트에서 다음 순서로 실행합니다.
+
+XML로 `cluster_internal` 사용자를 정의한 환경에서는 이 계정에 `GRANT SELECT, INSERT ON shop_benchmark.*`가 있어야 합니다. ConfigMap의 사용자 정의를 변경했다면 ClickHouse StatefulSet을 순차 재시작해 모든 Pod에 반영한 뒤 진행합니다.
+
+기본값은 `manifests/chi.yaml` 배포의 `chi-chi-cluster1-0-0-0`입니다. free operator 배포에서는 실행 전에 `export LAB_CLICKHOUSE_POD=clickhouse-0`으로 바꿉니다.
+
+대용량 생성 스크립트는 ClickHouse 프로필의 낮은 기본값에 영향을 받지 않도록 쿼리별 `max_memory_usage`를 기본 2GB로 지정합니다. 실행 전에 Pod와 로컬 VM의 여유 메모리를 확인하고, 환경에 맞춰 `LAB_MAX_MEMORY_USAGE`를 조정합니다.
+
+```bash
+export LAB_CLICKHOUSE_POD=${LAB_CLICKHOUSE_POD:-chi-chi-cluster1-0-0-0}
+
+kubectl --context kind-clickhouse-lab -n clickhouse exec -i "$LAB_CLICKHOUSE_POD" -c clickhouse \
+  -- clickhouse-client --multiquery \
+  < examples/shopping-journey/cluster/common/schema.sql
+
+LAB_MAX_MEMORY_USAGE=2000000000 \
+  examples/shopping-journey/cluster/common/run-generate-data.sh
+
+kubectl --context kind-clickhouse-lab -n clickhouse exec -i "$LAB_CLICKHOUSE_POD" -c clickhouse \
+  -- clickhouse-client --multiquery --format PrettyCompact \
+  < examples/shopping-journey/cluster/common/validate-data.sql
+```
+
+검증 SQL의 모든 `passed`가 1이고 replica queue가 0인 snapshot만 A1~A7 조회 비교에 사용합니다. 실패한 적재 결과에 추가 INSERT로 맞추지 않고 깨끗한 공통 DB에서 다시 생성합니다. A7은 같은 입력을 사용하되 최소 `occurred_at` 기준의 전용 기대값으로 판정합니다.
+
+각 chunk는 동기적으로 완료된 뒤 다음 범위를 실행합니다. `insert_deduplication_token`을 INSERT 전체에 고정하면 Distributed 입력이 여러 블록으로 분할될 때 정상 블록까지 중복으로 판단될 수 있으므로 사용하지 않습니다. 실행 스크립트는 기존 행이 있으면 중단해 전체 재실행에 의한 중복을 방지합니다.
+
+## 실행 결과
+
+2026-09-21, ClickHouse `26.8.6.5`, `GUIDE(free operator).md`의 별도 3 shard × 3 replica 배포에서 확인했습니다. 저장소 기본 `manifests/chi.yaml`의 4 shard × 3 replica 배포 결과가 아닙니다.
+
+| 항목 | 결과 |
+|---|---:|
+| chunk 크기 | 1,000,000 journey |
+| 전체 journey | 20,000,000 |
+| 전체 원본 event | 22,200,000행 |
+| 적재 시간 | 2분 58.30초 |
+| 원본 압축 크기 | 499.39 MiB, shard 합계·replica 1벌 기준 |
+| Pod 재시작·OOM | 0 |
+| replica queue·delay | 0 / 0 |
+
+분산 상품 100개는 각각 111,000행, 대규모 집중 상품은 11,100,000행이었으며 이벤트 종류별 예상 행 수도 모두 일치했습니다.
+
+### 공통 원본 조회 기준값
+
+동시성 1, background merge가 없는 상태에서 `clickhouse-benchmark`로 측정했습니다.
+
+현재 결과는 실행 가능 여부와 대략적인 구조 차이를 확인한 **1차 예비 측정**입니다. 모든 조회를 10회씩 실행한 결과가 아니며, 아래 표의 `반복` 열이 실제 실행 횟수입니다. 성공한 소규모 조회는 10회, 대규모 HLL은 5회 실행했고, 메모리 초과가 발생한 조회는 1회만 실행했습니다.
+
+| 조회 | 반복 | p50 | p95 | 결과 |
+|---|---:|---:|---:|---|
+| 분산 상품 1개 event HLL | 10회 | 22ms | 77ms | 성공 |
+| 대규모 집중 상품 event HLL | 5회 | 235ms | 567ms | 성공 |
+| 분산 상품 1개 event 최초 선택 후 시간별 exact count | 10회 | 233ms | 375ms | 성공 |
+| 대규모 집중 상품 event 최초 선택 후 시간별 exact count | 1회 | - | - | 메모리 한도 3.52 GiB 초과 |
+
+`p50`은 전체 실행 중 50%가 완료된 시간이고 `p95`는 95%가 완료된 시간입니다. 현재처럼 10회만 측정한 p95는 가장 느린 한두 번의 실행에 크게 좌우되므로 운영 SLA나 확정 성능값으로 사용하지 않습니다.
+
+정식 구조 비교에서는 다음 조건으로 다시 측정합니다.
+
+| 항목 | 정식 측정 기준 |
+|---|---|
+| 워밍업 | 결과에서 제외하고 5~10회 실행 |
+| 실제 측정 | 조회별 최소 100회 |
+| 동시성 | 1, 5, 10을 분리해 측정 |
+| 응답 시간 | p50, p95, p99 |
+| 안정성 | 성공·실패·timeout 비율 |
+| 자원 | 읽은 행·바이트, 최대 메모리, CPU |
+| 실행 조건 | 적재·merge가 없는 상태와 동시에 수행되는 상태를 분리 |
+
+대규모 조회가 1차 실행에서 메모리 초과 또는 장시간 실행된 경우에는 같은 쿼리를 100회 반복하지 않습니다. 먼저 쿼리와 테이블 구조를 개선하고 단일 실행이 자원 한도 안에서 끝나는지 확인한 후 반복 측정합니다.
+
+HLL 결과는 같은 상품의 정확한 고유 journey 수와 비교했습니다.
+
+| 상품 | event_kind | 정확 count | HLL | 상대 오차 |
+|---|---|---:|---:|---:|
+| 분산 상품 1개 | NOTIFY | 100,000 | 99,072 | 0.928% |
+| 분산 상품 1개 | CLICK | 5,000 | 5,167 | 3.340% |
+| 분산 상품 1개 | VIEW | 4,000 | 4,055 | 1.375% |
+| 분산 상품 1개 | CART | 1,000 | 997 | 0.300% |
+| 분산 상품 1개 | PURCHASE | 500 | 513 | 2.600% |
+| 대규모 집중 상품 | NOTIFY | 10,000,000 | 10,031,739 | 0.317% |
+| 대규모 집중 상품 | CLICK | 500,000 | 492,597 | 1.481% |
+| 대규모 집중 상품 | VIEW | 400,000 | 397,197 | 0.701% |
+| 대규모 집중 상품 | CART | 100,000 | 100,964 | 0.964% |
+| 대규모 집중 상품 | PURCHASE | 50,000 | 49,966 | 0.068% |
+
+분산 상품 1개의 `CLICK`은 상대 오차 3.340%로 초기 기준 3%를 통과하지 못했습니다. HLL 오차는 실행 시간이 짧다는 이유만으로 허용하지 않고, 낮은 cardinality를 포함한 실제 분포에서 별도로 판정해야 합니다. 나머지 항목은 초기 기준을 통과했습니다.
+
+대규모 집중 상품 exact 조회는 coordinator가 대표 이벤트를 직접 병합하는 방식에서 약 987만 행을 읽은 뒤 종료됐습니다. [A3](../a3-event-count/README.md)처럼 shard-local View에서 먼저 줄이면 완료할 수 있지만 시간·그룹 조회에 1분 이상 걸렸습니다. 따라서 현재 로컬 자원에서는 반복되는 서비스 조회에 dedup 또는 summary 파생 구조가 필요한 근거로 사용합니다.
+
+현재 lab의 cluster1을 사용할 계획입니다. 실행 전 실제 system.clusters, 서버 버전과 매니페스트 상태를 확인해야 합니다.
+로컬 테이블·복제·Distributed·로컬 MV를 구분하고, journey_id 샤딩을 첫 후보로 검토합니다.
+여러 shard에 같은 키가 존재하는 경우의 전체 상태 병합도 검증합니다.
+
+## 검증할 항목
+
+| 축 | 확인 |
+|---|---|
+| 정확성 | 반복 입력, 날짜 변경, 늦게 도착한 이벤트, 동률, 다중 그룹 |
+| 조회 | 상품 하나·묶음, 누적·시간별·그룹별 |
+| 성능 | 응답 시간 분포, 읽은 행·바이트, 메모리 |
+| 부하 | 동시 요청, 적재·병합 중 조회, 복제 지연 |
+| 상태 | replica 장애·복구 후 결과, 반복 적용과 재처리 |
+| summary | 갱신 지연, 대표 변경 보정, 누락·이중 집계 |
+
+모든 케이스는 shopping_events에 standalone과 같은 정규화·속성 보강 완료 이벤트를 입력합니다. 상위 원시 로그, 매핑·규칙 테이블과 그 MV는 실험용 DDL에서 제외합니다. 이 결과를 JSON 수집부터의 전체 파이프라인 성능으로 해석하지 않습니다.

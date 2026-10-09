@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1360" viewBox="0 0 1800 1360">
+  <defs>
+    <style>
+      .title { font: 700 34px 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; fill: #172033; }
+      .subtitle { font: 15px 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; fill: #59657a; }
+      .section { font: 700 21px 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; fill: #26334a; }
+      .name { font: 700 17px 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; fill: #172033; }
+      .engine { font: 700 12px 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; fill: #ffffff; }
+      .body { font: 14px 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; fill: #3f4c63; }
+      .small { font: 12px 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; fill: #687389; }
+      .code { font: 13px 'SFMono-Regular', Menlo, monospace; fill: #2e3950; }
+      .line { fill: none; stroke: #68758c; stroke-width: 2.2; marker-end: url(#arrow); }
+      .bus { fill: none; stroke: #68758c; stroke-width: 2.4; }
+      .cumulative { fill: none; stroke: #438965; stroke-width: 2.5; marker-end: url(#arrowGreen); }
+      .hourly { fill: none; stroke: #bd7048; stroke-width: 2.5; marker-end: url(#arrowOrange); }
+      .repair { fill: none; stroke: #875ab0; stroke-width: 2.3; stroke-dasharray: 8 6; marker-end: url(#arrowPurple); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#68758c"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#438965"/></marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#bd7048"/></marker>
+    <marker id="arrowPurple" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#875ab0"/></marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#182238" flood-opacity="0.12"/></filter>
+  </defs>
+
+  <rect width="1800" height="1360" fill="#f7f9fc"/>
+  <text x="55" y="55" class="title">A7 개선 검토안 · 이벤트별 최초 상태와 공통 Summary</text>
+  <text x="55" y="85" class="subtitle">각 이벤트 테이블의 MV가 해당 이벤트의 최초 상태만 관리하고, 누적·시간 delta는 공통 SummingMergeTree로 모은다.</text>
+
+  <rect x="35" y="115" width="1730" height="235" rx="18" fill="#eef3fb" stroke="#ced9e9"/>
+  <text x="60" y="148" class="section">1. 이벤트별 후보 테이블</text>
+
+  <g filter="url(#shadow)">
+    <rect x="60" y="175" width="300" height="135" rx="12" fill="#ffffff" stroke="#8299ba" stroke-width="2"/>
+    <rect x="405" y="175" width="300" height="135" rx="12" fill="#ffffff" stroke="#8299ba" stroke-width="2"/>
+    <rect x="750" y="175" width="300" height="135" rx="12" fill="#ffffff" stroke="#8299ba" stroke-width="2"/>
+    <rect x="1095" y="175" width="300" height="135" rx="12" fill="#ffffff" stroke="#8299ba" stroke-width="2"/>
+    <rect x="1440" y="175" width="300" height="135" rx="12" fill="#ffffff" stroke="#8299ba" stroke-width="2"/>
+  </g>
+  <g fill="#5e76a0">
+    <rect x="60" y="175" width="300" height="28" rx="11"/><rect x="405" y="175" width="300" height="28" rx="11"/><rect x="750" y="175" width="300" height="28" rx="11"/><rect x="1095" y="175" width="300" height="28" rx="11"/><rect x="1440" y="175" width="300" height="28" rx="11"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="210" y="194" class="engine">ReplicatedReplacingMergeTree</text><text x="210" y="235" class="name">notification_events_local</text>
+    <text x="555" y="194" class="engine">ReplicatedReplacingMergeTree</text><text x="555" y="235" class="name">view_events_local</text>
+    <text x="900" y="194" class="engine">ReplicatedReplacingMergeTree</text><text x="900" y="235" class="name">cart_events_local</text>
+    <text x="1245" y="194" class="engine">ReplicatedReplacingMergeTree</text><text x="1245" y="235" class="name">click_events_local</text>
+    <text x="1590" y="194" class="engine">ReplicatedReplacingMergeTree</text><text x="1590" y="235" class="name">purchase_events_local</text>
+    <text x="210" y="270" class="small">journey별 NOTIFY 후보</text><text x="555" y="270" class="small">journey별 VIEW 후보</text><text x="900" y="270" class="small">journey별 CART 후보</text><text x="1245" y="270" class="small">journey별 CLICK 후보</text><text x="1590" y="270" class="small">journey별 PURCHASE 후보</text>
+    <text x="210" y="292" class="code">product_id · journey_id · occurred_at</text><text x="555" y="292" class="code">product_id · journey_id · occurred_at</text><text x="900" y="292" class="code">product_id · journey_id · occurred_at</text><text x="1245" y="292" class="code">product_id · journey_id · occurred_at</text><text x="1590" y="292" class="code">product_id · journey_id · occurred_at</text>
+  </g>
+
+  <rect x="35" y="375" width="1730" height="305" rx="18" fill="#fff6f1" stroke="#ead2c2"/>
+  <text x="60" y="408" class="section">2. 이벤트별 최초 상태 · WITH candidates/current_state 조건을 수행하는 MV 5개</text>
+
+  <path class="line" d="M210 310 L210 440"/><path class="line" d="M555 310 L555 440"/><path class="line" d="M900 310 L900 440"/><path class="line" d="M1245 310 L1245 440"/><path class="line" d="M1590 310 L1590 440"/>
+  <g text-anchor="middle" class="small"><text x="210" y="366">NOTIFY 상태 MV</text><text x="555" y="366">VIEW 상태 MV</text><text x="900" y="366">CART 상태 MV</text><text x="1245" y="366">CLICK 상태 MV</text><text x="1590" y="366">PURCHASE 상태 MV</text></g>
+
+  <g filter="url(#shadow)">
+    <rect x="60" y="440" width="300" height="195" rx="12" fill="#ffffff" stroke="#be744e" stroke-width="2"/>
+    <rect x="405" y="440" width="300" height="195" rx="12" fill="#ffffff" stroke="#be744e" stroke-width="2"/>
+    <rect x="750" y="440" width="300" height="195" rx="12" fill="#ffffff" stroke="#be744e" stroke-width="2"/>
+    <rect x="1095" y="440" width="300" height="195" rx="12" fill="#ffffff" stroke="#be744e" stroke-width="2"/>
+    <rect x="1440" y="440" width="300" height="195" rx="12" fill="#ffffff" stroke="#be744e" stroke-width="2"/>
+  </g>
+  <g fill="#ad6546"><rect x="60" y="440" width="300" height="28" rx="11"/><rect x="405" y="440" width="300" height="28" rx="11"/><rect x="750" y="440" width="300" height="28" rx="11"/><rect x="1095" y="440" width="300" height="28" rx="11"/><rect x="1440" y="440" width="300" height="28" rx="11"/></g>
+  <g text-anchor="middle">
+    <text x="210" y="459" class="engine">ReplicatedReplacingMergeTree</text><text x="210" y="494" class="name">notification_first_</text><text x="210" y="516" class="name">event_state_local</text>
+    <text x="555" y="459" class="engine">ReplicatedReplacingMergeTree</text><text x="555" y="494" class="name">view_first_</text><text x="555" y="516" class="name">event_state_local</text>
+    <text x="900" y="459" class="engine">ReplicatedReplacingMergeTree</text><text x="900" y="494" class="name">cart_first_</text><text x="900" y="516" class="name">event_state_local</text>
+    <text x="1245" y="459" class="engine">ReplicatedReplacingMergeTree</text><text x="1245" y="494" class="name">click_first_</text><text x="1245" y="516" class="name">event_state_local</text>
+    <text x="1590" y="459" class="engine">ReplicatedReplacingMergeTree</text><text x="1590" y="494" class="name">purchase_first_</text><text x="1590" y="516" class="name">event_state_local</text>
+  </g>
+  <g class="code" text-anchor="middle">
+    <text x="210" y="550">first_occurred_at</text><text x="210" y="573">previous_first_occurred_at</text><text x="210" y="596">cumulative_delta · first_version</text>
+    <text x="555" y="550">first_occurred_at</text><text x="555" y="573">previous_first_occurred_at</text><text x="555" y="596">cumulative_delta · first_version</text>
+    <text x="900" y="550">first_occurred_at</text><text x="900" y="573">previous_first_occurred_at</text><text x="900" y="596">cumulative_delta · first_version</text>
+    <text x="1245" y="550">first_occurred_at</text><text x="1245" y="573">previous_first_occurred_at</text><text x="1245" y="596">cumulative_delta · first_version</text>
+    <text x="1590" y="550">first_occurred_at</text><text x="1590" y="573">previous_first_occurred_at</text><text x="1590" y="596">cumulative_delta · first_version</text>
+  </g>
+  <g class="small" text-anchor="middle"><text x="210" y="620">신규 또는 더 빠른 상태만 추가</text><text x="555" y="620">신규 또는 더 빠른 상태만 추가</text><text x="900" y="620">신규 또는 더 빠른 상태만 추가</text><text x="1245" y="620">신규 또는 더 빠른 상태만 추가</text><text x="1590" y="620">신규 또는 더 빠른 상태만 추가</text></g>
+
+  <path class="bus" d="M210 635 L210 690 M555 635 L555 690 M900 635 L900 690 M1245 635 L1245 690 M1590 635 L1590 690 M210 690 L1590 690"/>
+  <path class="cumulative" d="M900 690 L900 710 L525 710 L525 745"/>
+  <path class="hourly" d="M900 690 L900 710 L1275 710 L1275 745"/>
+
+  <rect x="330" y="745" width="390" height="75" rx="37" fill="#eaf5ef" stroke="#5c9b76" stroke-width="2"/>
+  <text x="525" y="775" text-anchor="middle" class="name">이벤트별 누적 MV 5개</text><text x="525" y="799" text-anchor="middle" class="small">cumulative_delta=1만 해당 count 열에 +1</text>
+  <rect x="1080" y="745" width="390" height="75" rx="37" fill="#fff0e7" stroke="#c9824f" stroke-width="2"/>
+  <text x="1275" y="775" text-anchor="middle" class="name">이벤트별 시간 MV 5개</text><text x="1275" y="799" text-anchor="middle" class="small">신규 +1 · 시간 이동은 이전 -1 / 신규 +1</text>
+
+  <rect x="35" y="840" width="1730" height="310" rx="18" fill="#f1f8f4" stroke="#cde1d5"/>
+  <text x="60" y="873" class="section">3. 공통 숫자 Summary</text>
+  <g filter="url(#shadow)">
+    <rect x="120" y="900" width="660" height="205" rx="12" fill="#ffffff" stroke="#4d9271" stroke-width="2"/>
+    <rect x="1020" y="900" width="660" height="205" rx="12" fill="#ffffff" stroke="#bd7250" stroke-width="2"/>
+  </g>
+  <rect x="120" y="900" width="660" height="30" rx="11" fill="#3f8766"/><text x="450" y="920" text-anchor="middle" class="engine">누적 Summary · ReplicatedSummingMergeTree</text>
+  <rect x="1020" y="900" width="660" height="30" rx="11" fill="#ad6546"/><text x="1350" y="920" text-anchor="middle" class="engine">시간 Summary · ReplicatedSummingMergeTree</text>
+  <text x="150" y="962" class="name">cumulative_summary_local</text><text x="150" y="989" class="code">mall · store · product · 5개 Int64 count</text><text x="150" y="1018" class="small">각 shard에 delta와 부분 합계 저장</text>
+  <path class="line" d="M450 1030 L450 1060"/><text x="470" y="1051" class="small">Distributed</text><text x="450" y="1085" text-anchor="middle" class="name">cumulative_summary_by_product · sum()</text>
+  <text x="1050" y="962" class="name">hourly_summary_local</text><text x="1050" y="989" class="code">mall · store · product · event_hour · 5개 Int64 count</text><text x="1050" y="1018" class="small">signed delta와 shard별 부분 합계 저장</text>
+  <path class="line" d="M1350 1030 L1350 1060"/><text x="1370" y="1051" class="small">Distributed</text><text x="1350" y="1085" text-anchor="middle" class="name">hourly_summary_by_product · sum()</text>
+  <path class="cumulative" d="M525 820 L525 880 L450 880 L450 900"/><path class="hourly" d="M1275 820 L1275 880 L1350 880 L1350 900"/>
+
+  <rect x="650" y="1175" width="500" height="70" rx="14" fill="#edf3ff" stroke="#9aadd0" stroke-width="2"/>
+  <text x="900" y="1204" text-anchor="middle" class="name">지표 조회 API</text><text x="900" y="1228" text-anchor="middle" class="small">누적 View 또는 시간 View의 작은 숫자 행만 조회</text>
+  <path class="line" d="M450 1105 L450 1140 L820 1140 L820 1175"/><path class="line" d="M1350 1105 L1350 1140 L980 1140 L980 1175"/>
+
+  <rect x="260" y="1280" width="1280" height="48" rx="12" fill="#f5f0fa" stroke="#c5b0da"/>
+  <text x="900" y="1310" text-anchor="middle" class="body">동시 판정 오차 보정 · 이벤트 FINAL 정답 − 현재 Summary = signed correction delta</text>
+  <path class="repair" d="M650 1280 L450 1280 L450 1110"/><path class="repair" d="M1150 1280 L1350 1280 L1350 1110"/>
+</svg>

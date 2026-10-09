@@ -94,6 +94,13 @@ PRODUCTION.md를 AWS(EKS + Altinity 오퍼레이터) 환경에 구체적으로 �
 (앱 푸시 발송/클릭 로그 → Materialized View 기반 실시간 CTR 통계)은
 **[apps/push-click-service](./apps/push-click-service)**를 참고하세요.
 
+## 도메인 예제
+
+상품 안내·클릭·구매 이벤트를 다루는
+[쇼핑몰 구매 여정 예제](./examples/shopping-journey/README.md)를 제공합니다.
+ERD, 단일 노드용 DDL, 샘플 데이터와 조회 SQL을 포함하며, 기존 앱과 별도 DB를 사용합니다.
+클러스터 적용과 실행 검증은 아직 진행하지 않은 초안입니다.
+
 ## LLM 에이전트 툴 콜링
 
 ClickHouse를 LLM 에이전트가 직접(MCP) 또는 앱을 경유해(OpenAPI/AgentCore
