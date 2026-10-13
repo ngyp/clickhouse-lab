@@ -124,3 +124,10 @@ chDB는 1.5GB로 성공)는 **[CHDB-BENCHMARK.md](./CHDB-BENCHMARK.md)**를,
 평범한 크기의 데이터로 chDB/pandas/Polars/DuckDB 네 엔진의 속도를 비교한
 결과(top-N 정렬에서 API 선택이 성패를 가른 사례 포함)는
 **[CHDB-SPEED-BENCHMARK.md](./CHDB-SPEED-BENCHMARK.md)**를 참고하세요.
+
+## ClickHouse 아키텍처 기술 리포트
+
+ClickHouse가 실시간 로그 집계에 빠른 이유를 컬럼 지향 저장(SIMD·CPU 캐시·압축),
+불변 파트와 백그라운드 머지, 그래뉼과 sparse index 설계(정렬·카디널리티·파티션),
+벤치마크(ClickBench와 이 레포의 실측 결과) 순서로 정리한 리포트는
+**[CLICKHOUSE-ARCHITECTURE.md](./CLICKHOUSE-ARCHITECTURE.md)**를 참고하세요.
